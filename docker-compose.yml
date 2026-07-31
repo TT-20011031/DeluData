@@ -1,0 +1,240 @@
+x-backend-common: &backend-common
+  build:
+    context: ./backend
+    dockerfile: Dockerfile
+  env_file:
+    - ${BACKEND_ENV_FILE:-./backend/.env}
+  environment:
+    DB_HOST: ${DB_HOST:-mysql}
+    DB_PORT: ${DB_PORT:-3306}
+    DB_USER: ${DB_USER:-root}
+    DB_PASSWORD: ${DB_PASSWORD:-rootpassword}
+    DB_NAME: ${DB_NAME:-DeluData}
+    REDIS_HOST: ${REDIS_HOST:-redis}
+    REDIS_PORT: ${REDIS_PORT:-6379}
+  restart: unless-stopped
+  volumes:
+    - backend_data:/app/data
+    - backend_logs:/app/logs
+  depends_on:
+    mysql:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  mysql:
+    container_name: deludata-mysql
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-DeluData}
+      MYSQL_ROOT_HOST: "%"
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  redis:
+    container_name: deludata-redis
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  admin-backend:
+    <<: *backend-common
+    container_name: admin-backend-pro
+    command: uvicorn app.entrypoints.admin_main:app --host 0.0.0.0 --port 8000
+    expose:
+      - "8000"
+
+  experience-backend:
+    <<: *backend-common
+    container_name: experience-backend-pro
+    command: uvicorn app.entrypoints.experience_main:app --host 0.0.0.0 --port 8001
+    expose:
+      - "8001"
+
+  ingestion-worker:
+    <<: *backend-common
+    container_name: ingestion-worker-pro
+    command: python -m app.entrypoints.ingestion_worker
+    environment:
+      RAG_OCR_DPI: ${RAG_OCR_DPI:-130}
+      RAG_OCR_WORKER_PROCESSES: ${RAG_OCR_WORKER_PROCESSES:-3}
+      RAG_OCR_MAX_INFLIGHT_PAGES: ${RAG_OCR_MAX_INFLIGHT_PAGES:-3}
+      RAG_OCR_WORKER_MAX_OCR_IMAGE_HEIGHT_PX: ${RAG_OCR_WORKER_MAX_OCR_IMAGE_HEIGHT_PX:-4000}
+      RAG_OCR_WORKER_MAX_RENDER_PIXELS: ${RAG_OCR_WORKER_MAX_RENDER_PIXELS:-30000000}
+      RAG_OCR_WORKER_SOURCE_TILE_OVERLAP_PX: ${RAG_OCR_WORKER_SOURCE_TILE_OVERLAP_PX:-96}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      admin-backend:
+        condition: service_started
+
+  semantic-governance-worker:
+    <<: *backend-common
+    container_name: semantic-governance-worker-pro
+    command: python -m app.entrypoints.semantic_governance_worker
+    environment:
+      SEMANTIC_GOVERNANCE_LEASE_TIMEOUT_SEC: ${SEMANTIC_GOVERNANCE_LEASE_TIMEOUT_SEC:-180}
+      SEMANTIC_GOVERNANCE_WORKSPACE_MAX_RUNNING: ${SEMANTIC_GOVERNANCE_WORKSPACE_MAX_RUNNING:-1}
+      SEMANTIC_GOVERNANCE_IDLE_SLEEP_SEC: ${SEMANTIC_GOVERNANCE_IDLE_SLEEP_SEC:-3}
+      SEMANTIC_GOVERNANCE_STALE_CHECK_SEC: ${SEMANTIC_GOVERNANCE_STALE_CHECK_SEC:-30}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      admin-backend:
+        condition: service_started
+
+  semantic-access-bootstrap-worker:
+    <<: *backend-common
+    container_name: semantic-access-bootstrap-worker-pro
+    command: python -m app.entrypoints.semantic_access_bootstrap_worker
+    environment:
+      SEMANTIC_ACCESS_BOOTSTRAP_LEASE_TIMEOUT_SEC: ${SEMANTIC_ACCESS_BOOTSTRAP_LEASE_TIMEOUT_SEC:-180}
+      SEMANTIC_ACCESS_BOOTSTRAP_WORKSPACE_MAX_RUNNING: ${SEMANTIC_ACCESS_BOOTSTRAP_WORKSPACE_MAX_RUNNING:-1}
+      SEMANTIC_ACCESS_BOOTSTRAP_IDLE_SLEEP_SEC: ${SEMANTIC_ACCESS_BOOTSTRAP_IDLE_SLEEP_SEC:-3}
+      SEMANTIC_ACCESS_BOOTSTRAP_STALE_CHECK_SEC: ${SEMANTIC_ACCESS_BOOTSTRAP_STALE_CHECK_SEC:-30}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      admin-backend:
+        condition: service_started
+
+  permission-evidence-worker:
+    <<: *backend-common
+    container_name: permission-evidence-worker-pro
+    command: python -m app.entrypoints.permission_evidence_worker
+    environment:
+      PERMISSION_EVIDENCE_LEASE_TIMEOUT_SEC: ${PERMISSION_EVIDENCE_LEASE_TIMEOUT_SEC:-180}
+      PERMISSION_EVIDENCE_IDLE_SLEEP_SEC: ${PERMISSION_EVIDENCE_IDLE_SLEEP_SEC:-3}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      admin-backend:
+        condition: service_started
+
+  wiki-compile-worker:
+    <<: *backend-common
+    container_name: wiki-compile-worker-pro
+    command: python -m app.entrypoints.wiki_compile_worker
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      admin-backend:
+        condition: service_started
+
+  # 第二个 wiki 编译 worker 副本：
+  # - 避免 doc_upload 任务独占队列时 manual_workspace 长时间 pending
+  # - 两个 worker 通过 SKIP LOCKED + run_token 无冲突抢占，支持并发不同类型任务
+  wiki-compile-worker-2:
+    <<: *backend-common
+    container_name: wiki-compile-worker-2-pro
+    command: python -m app.entrypoints.wiki_compile_worker
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      admin-backend:
+        condition: service_started
+
+  knowledge-mcp:
+    <<: *backend-common
+    container_name: knowledge-mcp-pro
+    command: python -m app.mcp.knowledge_server
+    environment:
+      DB_HOST: ${DB_HOST:-mysql}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_USER: ${DB_USER:-root}
+      DB_PASSWORD: ${DB_PASSWORD:-rootpassword}
+      DB_NAME: ${DB_NAME:-DeluData}
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+    expose:
+      - "8020"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend-admin:
+    container_name: frontend-admin-pro
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    expose:
+      - "80"
+
+  frontend-experience:
+    container_name: frontend-experience-pro
+    build:
+      context: ./kiosk-frontend
+    restart: unless-stopped
+    expose:
+      - "80"
+
+  frontend-platform:
+    container_name: frontend-platform-pro
+    build:
+      context: ./frontend-platform
+      args:
+        VITE_APP_BASE: /platform/
+    restart: unless-stopped
+    expose:
+      - "80"
+
+  nginx:
+    container_name: gateway-nginx-pro
+    image: nginx:1.27-alpine
+    depends_on:
+      - admin-backend
+      - experience-backend
+      - knowledge-mcp
+      - frontend-admin
+      - frontend-experience
+      - frontend-platform
+    restart: unless-stopped
+    ports:
+      - "8030:8020"
+      - "8031:8021"
+      - "8032:8022"
+    volumes:
+      - ./deploy/nginx/gateway.conf:/etc/nginx/conf.d/default.conf:ro
+
+volumes:
+  mysql_data:
+  redis_data:
+  backend_data:
+  backend_logs:

@@ -1,0 +1,2 @@
+"""MCP entrypoints for DeluData."""
+

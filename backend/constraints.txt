@@ -1,0 +1,4 @@
+# 约束关键传递依赖，避免与 langchain / opentelemetry 生态冲突。
+protobuf>=5,<7
+packaging>=23.2,<26
+bcrypt==4.0.1

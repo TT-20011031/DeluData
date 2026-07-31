@@ -1,0 +1,16 @@
+export const KIOSK_INTERACTION = {
+  attractPresenceConfirmationMs: 3000,
+  attractPresenceDetectIntervalMs: 900,
+  attractPresenceMinDegrees: 8,
+  fallbackSnapshotWidth: 640,
+  fallbackSnapshotHeight: 480,
+  fallbackSnapshotMime: "image/jpeg",
+  fallbackSnapshotQuality: 0.9,
+  fallbackSnapshotBackground: "#111",
+  personaIntroMinDurationMs: 1800,
+  listeningSilenceTimeoutMs: 3000,
+  listeningCountdownSeconds: 15,
+  answerAutoReturnSeconds: 60,
+  rewardAutoReturnSeconds: 120,
+  rewardPlaceholderCode: "XXXX-XXXX-XXXX",
+} as const;

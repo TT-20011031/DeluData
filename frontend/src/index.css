@@ -1,0 +1,737 @@
+@import "tailwindcss";
+
+/* ========== Manus 风格深色主题 ========== */
+@theme {
+  /* 背景色系列 - Manus 深灰色调 */
+  --color-manus: #0d0d0d;
+  --color-manus-secondary: #161616;
+  --color-manus-tertiary: #1e1e1e;
+  --color-manus-hover: #2a2a2a;
+  --color-manus-elevated: #242424;
+  --color-manus-background: #0d0d0d;
+  --color-manus-bg: #0d0d0d;
+  --color-manus-surface: #161616;
+  --color-manus-primary: #1e1e1e;
+
+  /* 文本色系列 */
+  --color-manus-text: #e4e4e7;
+  --color-manus-muted: #a1a1aa;
+  --color-manus-subtle: #71717a;
+
+  /* 边框色 */
+  --color-manus-border: #27272a;
+  --color-manus-border-strong: #3f3f46;
+
+  /* 强调色 - Manus 蓝色 */
+  --color-accent: #3b82f6;
+  --color-accent-muted: #60a5fa;
+  --color-success: #22c55e;
+  --color-warning: #f59e0b;
+  --color-error: #ef4444;
+
+  /* 字体 */
+  --font-sans: 'Inter', 'SF Pro Display', 'Noto Sans SC', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace;
+
+  /* 圆角 */
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+}
+
+/* ========== Shadcn/UI CSS 变量 (Manus Dark Theme) ========== */
+:root {
+  --background: 0 0% 5%;
+  --foreground: 0 0% 90%;
+
+  --card: 0 0% 9%;
+  --card-foreground: 0 0% 90%;
+
+  --popover: 0 0% 9%;
+  --popover-foreground: 0 0% 90%;
+
+  --primary: 217 91% 60%;
+  --primary-foreground: 0 0% 100%;
+
+  --secondary: 0 0% 12%;
+  --secondary-foreground: 0 0% 90%;
+
+  --muted: 0 0% 15%;
+  --muted-foreground: 0 0% 64%;
+
+  --accent: 0 0% 15%;
+  --accent-foreground: 0 0% 90%;
+
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 0 0% 98%;
+
+  --border: 0 0% 15%;
+  --input: 0 0% 15%;
+  --ring: 217 91% 60%;
+  --selection-bg: rgba(96, 165, 250, 0.32);
+  --selection-fg: #ffffff;
+
+  --radius: 0.5rem;
+}
+
+/* ========== 基础样式 ========== */
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background-color: #0d0d0d;
+  color: #e4e4e7;
+  font-family: var(--font-sans);
+}
+
+/* 自定义滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
+}
+
+/* ========== Manus 风格工具类 ========== */
+
+/* 背景色 */
+.bg-manus {
+  background-color: #0d0d0d;
+}
+
+.bg-manus-secondary {
+  background-color: #161616;
+}
+
+.bg-manus-tertiary {
+  background-color: #1e1e1e;
+}
+
+.bg-manus-hover {
+  background-color: #2a2a2a;
+}
+
+.bg-manus-elevated {
+  background-color: #242424;
+}
+
+.bg-manus-background {
+  background-color: #0d0d0d;
+}
+
+.bg-manus-bg {
+  background-color: #0d0d0d;
+}
+
+.bg-manus-surface {
+  background-color: #161616;
+}
+
+.bg-manus-primary {
+  background-color: #1e1e1e;
+}
+
+/* 文本色 */
+.text-manus-text {
+  color: #e4e4e7;
+}
+
+.text-manus-muted {
+  color: #a1a1aa;
+}
+
+.text-manus-subtle {
+  color: #71717a;
+}
+
+/* 边框色 */
+.border-manus-border {
+  border-color: #27272a;
+}
+
+.border-manus-border-strong {
+  border-color: #3f3f46;
+}
+
+/* 强调色 */
+.text-accent {
+  color: #3b82f6;
+}
+
+.bg-accent {
+  background-color: #3b82f6;
+}
+
+.border-accent {
+  border-color: #3b82f6;
+}
+
+/* 按钮 */
+.btn-manus {
+  padding: 0.5rem 1rem;
+  border-radius: var(--radius-md);
+  background-color: #1e1e1e;
+  color: #e4e4e7;
+  border: 1px solid #27272a;
+  transition: all 0.15s ease;
+  cursor: pointer;
+}
+
+.btn-manus:hover {
+  background-color: #2a2a2a;
+  border-color: #3f3f46;
+}
+
+.btn-manus-primary {
+  background-color: #3b82f6;
+  border-color: #3b82f6;
+  color: white;
+}
+
+.btn-manus-primary:hover {
+  background-color: #2563eb;
+}
+
+/* 输入框 */
+.input-manus {
+  width: 100%;
+  padding: 0.75rem 1rem;
+  background-color: #161616;
+  border: 1px solid #27272a;
+  border-radius: var(--radius-md);
+  color: #e4e4e7;
+  transition: all 0.15s ease;
+}
+
+.input-manus::placeholder {
+  color: #71717a;
+}
+
+.input-manus:focus {
+  outline: none;
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+}
+
+/* 卡片 */
+.card-manus {
+  background-color: #161616;
+  border: 1px solid #27272a;
+  border-radius: var(--radius-lg);
+}
+
+/* 圆角 */
+.rounded-manus {
+  border-radius: var(--radius-md);
+}
+
+/* 文本省略 */
+.text-ellipsis-1 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 动画 */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.2s ease-out;
+}
+
+.animate-slide-up {
+  animation: slide-up 0.2s ease-out;
+}
+
+/* ========== 浅色主题 ========== */
+.light {
+  /* 背景色系列 - 浅色模式 (更纯净的白色) */
+  --color-manus: #ffffff;
+  --color-manus-secondary: #fafafa;
+  --color-manus-tertiary: #f5f5f5;
+  --color-manus-hover: #ebebeb;
+  --color-manus-elevated: #ffffff;
+  --color-manus-background: #ffffff;
+  --color-manus-bg: #ffffff;
+  --color-manus-surface: #ffffff;
+  --color-manus-primary: #f5f5f5;
+
+  /* 文本色系列 */
+  --color-manus-text: #1a1a1a;
+  --color-manus-muted: #525252;
+  --color-manus-subtle: #737373;
+
+  /* 边框色 */
+  --color-manus-border: #e5e5e5;
+  --color-manus-border-strong: #d4d4d4;
+
+  /* 强调色 - 保持统一 */
+  --color-accent: #09090b;
+  --color-accent-muted: #27272a;
+  --color-success: #16a34a;
+  --color-warning: #d97706;
+  --color-error: #dc2626;
+
+  /* Shadcn/UI CSS 变量覆盖 */
+  --background: 0 0% 100%;
+  --foreground: 0 0% 10%;
+  --card: 0 0% 100%;
+  --card-foreground: 0 0% 10%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 0 0% 10%;
+  --ring: 217 91% 60%;
+  --primary: 0 0% 3.5%;
+  /* #09090b */
+  --selection-bg: rgba(59, 130, 246, 0.24);
+  --selection-fg: #0f172a;
+}
+
+.light body {
+  background-color: #ffffff;
+  color: #1a1a1a;
+}
+
+/* 浅色主题背景色覆盖 */
+.light .bg-manus {
+  background-color: #ffffff;
+}
+
+.light .bg-manus-secondary {
+  background-color: #fafafa;
+}
+
+.light .bg-manus-tertiary {
+  background-color: #f5f5f5;
+}
+
+.light .bg-manus-hover {
+  background-color: #ebebeb;
+}
+
+.light .bg-manus-elevated {
+  background-color: #ffffff;
+}
+
+.light .bg-manus-background {
+  background-color: #ffffff;
+}
+
+.light .bg-manus-bg {
+  background-color: #ffffff;
+}
+
+.light .bg-manus-surface {
+  background-color: #ffffff;
+}
+
+.light .bg-manus-primary {
+  background-color: #f5f5f5;
+}
+
+/* 浅色主题文本色覆盖 */
+.light .text-manus-text {
+  color: #1a1a1a;
+}
+
+.light .text-manus-muted {
+  color: #525252;
+}
+
+.light .text-manus-subtle {
+  color: #737373;
+}
+
+/* 浅色主题边框色覆盖 */
+.light .border-manus-border {
+  border-color: #d4d4d4;
+}
+
+.light .border-manus-border-strong {
+  border-color: #a3a3a3;
+}
+
+/* 浅色主题强调色覆盖 */
+.light .text-accent {
+  color: #09090b;
+}
+
+.light .bg-accent {
+  background-color: #09090b;
+}
+
+.light .border-accent {
+  border-color: #09090b;
+}
+
+/* 浅色主题按钮样式 */
+.light .btn-manus {
+  background-color: #e5e5e5;
+  color: #1a1a1a;
+  border-color: #d4d4d4;
+}
+
+.light .btn-manus:hover {
+  background-color: #d9d9d9;
+  border-color: #a3a3a3;
+}
+
+.light .btn-manus-primary {
+  background-color: #09090b;
+  border-color: #09090b;
+  color: white;
+}
+
+.light .btn-manus-primary:hover {
+  background-color: #27272a;
+}
+
+/* 浅色主题输入框样式 */
+.light .input-manus {
+  background-color: #ffffff;
+  border-color: #d4d4d4;
+  color: #1a1a1a;
+}
+
+.light .input-manus::placeholder {
+  color: #737373;
+}
+
+.light .input-manus:focus {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.2);
+}
+
+/* 浅色主题卡片样式 */
+.light .card-manus {
+  background-color: #ffffff;
+  border-color: #d4d4d4;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1);
+}
+
+/* 浅色主题滚动条 */
+.light ::-webkit-scrollbar-track {
+  background: #f0f0f0;
+}
+
+.light ::-webkit-scrollbar-thumb {
+  background: #c4c4c4;
+}
+
+.light ::-webkit-scrollbar-thumb:hover {
+  background: #a3a3a3;
+}
+
+/* ========== ThinkingPanel 思考面板样式 ========== */
+/* 浅色模式：深色文字 + 白色半透明背景 */
+.light .thinking-content,
+.light .thinking-content p,
+.light .thinking-content li,
+.light .thinking-content span,
+.light .thinking-content code {
+  color: #1f2937 !important;
+}
+
+.light .thinking-content h1,
+.light .thinking-content h2,
+.light .thinking-content h3,
+.light .thinking-content h4,
+.light .thinking-content h5,
+.light .thinking-content h6 {
+  color: #111827 !important;
+}
+
+/* 深色模式：浅色文字 */
+.dark .thinking-content,
+.dark .thinking-content p,
+.dark .thinking-content li,
+.dark .thinking-content span,
+.dark .thinking-content code {
+  color: #f4f4f5 !important;
+}
+
+.dark .thinking-content h1,
+.dark .thinking-content h2,
+.dark .thinking-content h3,
+.dark .thinking-content h4,
+.dark .thinking-content h5,
+.dark .thinking-content h6 {
+  color: #ffffff !important;
+}
+
+/* ========== StepItem 数据无效遮罩样式 ========== */
+/* 浅色模式：白色毛玻璃 + 深色文字 */
+.light .step-invalid-overlay {
+  background: rgba(255, 255, 255, 0.85);
+}
+
+.light .step-invalid-badge {
+  background: rgba(255, 255, 255, 0.98);
+  border: 1px solid #d1d5db;
+}
+
+.light .step-invalid-badge svg {
+  color: #6b7280;
+}
+
+.light .step-invalid-badge span {
+  color: #374151;
+}
+
+/* 深色模式：深色毛玻璃 + 亮色文字 */
+.dark .step-invalid-overlay {
+  background: rgba(24, 24, 27, 0.9);
+}
+
+.dark .step-invalid-badge {
+  background: rgba(39, 39, 42, 0.98);
+  border: 1px solid #52525b;
+}
+
+.dark .step-invalid-badge svg {
+  color: #fbbf24;
+}
+
+.dark .step-invalid-badge span {
+  color: #f4f4f5;
+}
+
+/* 浅色主题 hover 状态覆盖 */
+.light .hover\:bg-manus-hover:hover {
+  background-color: #d9d9d9;
+}
+
+.light .hover\:border-manus-border-strong:hover {
+  border-color: #a3a3a3;
+}
+
+.light .hover\:text-manus-text:hover {
+  color: #1a1a1a;
+}
+
+/* 浅色主题状态颜色 */
+.light .text-success {
+  color: #16a34a;
+}
+
+.light .text-warning {
+  color: #d97706;
+}
+
+.light .text-error {
+  color: #dc2626;
+}
+
+.light .bg-success {
+  background-color: #16a34a;
+}
+
+.light .bg-warning {
+  background-color: #d97706;
+}
+
+.light .bg-error {
+  background-color: #dc2626;
+}
+
+/* 浅色主题代码块样式 */
+.light pre,
+.light code {
+  background-color: #f0f0f0;
+  border-color: #d4d4d4;
+}
+
+/* 全局选中样式（按主题变量自动切换） */
+::selection {
+  background-color: var(--selection-bg);
+  color: var(--selection-fg);
+}
+
+::-moz-selection {
+  background-color: var(--selection-bg);
+  color: var(--selection-fg);
+}
+
+/* 用户消息气泡（bg-accent）在明暗主题都使用强对比选中态，避免与底色撞色 */
+.chat-user-bubble::selection,
+.chat-user-bubble *::selection {
+  background-color: rgba(255, 255, 255, 0.92);
+  color: #111827;
+}
+
+.chat-user-bubble::-moz-selection,
+.chat-user-bubble *::-moz-selection {
+  background-color: rgba(255, 255, 255, 0.92);
+  color: #111827;
+}
+
+/* ========== 代码块样式修复 ========== */
+/* 强制所有 Prism token 背景透明，防止白色条纹 */
+pre[class*="language-"] *,
+code[class*="language-"] * {
+  background: transparent !important;
+}
+
+/* 确保代码行背景透明 */
+pre[class*="language-"] span,
+code[class*="language-"] span {
+  background-color: transparent !important;
+}
+
+@layer utilities {
+  @keyframes ripple {
+    0% {
+      transform: scale(0.8);
+      opacity: 1;
+    }
+
+    100% {
+      transform: scale(1.6);
+      opacity: 0;
+    }
+  }
+
+  .animate-ripple {
+    animation: ripple 2s cubic-bezier(0, 0.2, 0.8, 1) infinite;
+  }
+
+  @keyframes thinking-breath {
+    0%,
+    80%,
+    100% {
+      opacity: 0.25;
+      transform: scale(0.9);
+    }
+
+    40% {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  .animate-thinking-breath {
+    animation: thinking-breath 1.2s ease-in-out infinite;
+  }
+
+  /* Shimmer 加载动画 - 用于图片加载状态 */
+  @keyframes shimmer {
+    0% {
+      transform: translateX(-100%);
+    }
+
+    100% {
+      transform: translateX(100%);
+    }
+  }
+
+  .animate-shimmer {
+    animation: shimmer 1.5s ease-in-out infinite;
+  }
+
+  /* 隐藏滚动条 - 用于轮播组件 */
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    /* IE/Edge */
+    scrollbar-width: none;
+    /* Firefox */
+  }
+
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+    /* Chrome/Safari/Opera */
+  }
+}
+
+/* ========== DOCX 预览样式 ========== */
+.docx-preview-container {
+  background-color: #ffffff;
+  min-height: 100%;
+  overflow: auto;
+}
+
+/* docx-preview 生成的内容包装器 */
+.docx-preview-container .docx-wrapper {
+  background: white !important;
+  padding: 20px;
+}
+
+/* 确保文档内容可读 */
+.docx-preview-container .docx {
+  color: #000000 !important;
+  font-family: 'Calibri', 'Arial', sans-serif;
+  line-height: 1.5;
+}
+
+/* 表格样式 */
+.docx-preview-container table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.docx-preview-container td,
+.docx-preview-container th {
+  border: 1px solid #ddd;
+  padding: 8px;
+}
+
+/* 图片居中显示 */
+.docx-preview-container img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 10px auto;
+}
+
+@keyframes pdf-page-target-flash {
+  0% {
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0);
+    outline-color: rgba(59, 130, 246, 0);
+  }
+
+  30% {
+    box-shadow: 0 0 0 8px rgba(59, 130, 246, 0.18);
+    outline-color: rgba(59, 130, 246, 0.75);
+  }
+
+  100% {
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0);
+    outline-color: rgba(59, 130, 246, 0);
+  }
+}
+
+.pdf-page-anchor-highlight .pdf-page {
+  outline: 2px solid transparent;
+  animation: pdf-page-target-flash 0.8s ease-out;
+}

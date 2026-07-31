@@ -1,0 +1,29 @@
+未检测到 DB_ENCRYPTION_KEY，使用默认开发密钥。生产环境请务必设置环境变量！
+resource module not available on Windows
+========================================================================
+Science Experience Migration
+========================================================================
+[SKIP] museum_products.workspace_id already exists
+[SKIP] idx_museum_products_workspace_status already exists
+[SKIP] museum_guide_sessions.workspace_id already exists
+[SKIP] idx_museum_sessions_workspace_created already exists
+[SKIP] museum_artifacts.workspace_id already exists
+[SKIP] idx_museum_artifacts_workspace_name already exists
+[SKIP] idx_museum_artifacts_workspace_highlight already exists
+[SKIP] science_devices already exists
+[SKIP] science_sessions already exists
+[SKIP] science_wakeword_configs already exists
+[SKIP] science_voice_profiles already exists
+[SKIP] science_quiz_questions already exists
+[SKIP] science_quiz_attempts already exists
+[SKIP] science_reward_policies already exists
+[SKIP] science_coupons already exists
+[SKIP] science_coupon_issuances already exists
+[SKIP] science_coupon_redemptions already exists
+[SKIP] uq_science_redeem_issuance already exists
+[SKIP] idx_science_redeem_issuance_redeemed already exists
+========================================================================
+Science experience migration complete
+========================================================================
+
+[DONE] Migration script finished successfully.

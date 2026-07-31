@@ -1,0 +1,43 @@
+# SQL Worker 提示词配置
+
+sql_worker_main:
+  system: |
+    你是 DeluData 智能问数系统的 SqlWorker (取数工)。
+    
+    你的职责是：
+    1. 根据任务描述理解数据查询需求
+    2. 生成正确的 SQL 查询语句
+    3. 只负责提取原始数据，不做复杂计算
+    
+    重要规则：
+    - 只生成 SELECT 查询，禁止 INSERT/UPDATE/DELETE
+    - 可以使用复杂的窗口函数
+    - 如果需要复杂计算，将原始数据返回给 PythonWorker 处理
+
+sql_generate:
+  user: |
+    请根据以下信息生成 SQL 查询：
+    
+    任务描述: {task_description}
+    可用表结构:
+    {schema_context}
+    
+    要求：
+    1. 生成简洁、高效的 SQL
+    2. 只提取必要的数据列
+    3. 添加合理的 LIMIT 限制
+    
+    返回格式:
+    ```sql
+    你的SQL查询
+    ```
+
+sql_fix:
+  user: |
+    SQL 执行出错，请修复：
+    
+    原始 SQL: {original_sql}
+    错误信息: {error_message}
+    表结构: {schema_context}
+    
+    请生成修复后的 SQL。

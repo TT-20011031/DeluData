@@ -1,0 +1,22 @@
+[1] Importing experience_main...
+[2] App created: DeluData Experience Backend
+[3] Routes:
+     /openapi.json {'GET', 'HEAD'}
+     /docs {'GET', 'HEAD'}
+     /docs/oauth2-redirect {'GET', 'HEAD'}
+     /redoc {'GET', 'HEAD'}
+     /api/static 
+     /static 
+     /health {'GET'}
+     /health/db {'GET'}
+     /health/full {'GET'}
+     /api/experience/session/start {'POST'}
+     /api/experience/wake {'POST'}
+     /api/experience/asr-turn {'POST'}
+     /api/experience/speech/transcribe {'POST'}
+     /api/experience/quiz/start {'POST'}
+     /api/experience/quiz/answer {'POST'}
+     /api/experience/reward/current {'GET'}
+     /api/experience/coupon/qrcode/{issuance_id} {'GET'}
+     / {'GET'}
+[DONE] Import successful.

@@ -1,0 +1,60 @@
+# 忽略 Python 相关
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+# 忽略 IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 忽略环境配置
+.env
+.env.local
+.env.*
+!.env.example
+!.env.*.example
+*.local
+
+# 忽略日志和数据
+*.log
+logs/
+data/
+*.log
+*.db
+*.sqlite3
+
+# 忽略构建产物
+dist/
+build/
+*.egg-info/
+
+# 忽略依赖缓存
+.cache/
+.tmp/
+pip-log.txt
+
+# 忽略测试覆盖率
+htmlcov/
+.coverage
+.pytest_cache/
+
+# 忽略 Node 相关 (前端)
+node_modules/
+.npm
+
+# Project-local backups and temporary artifacts
+/backups/
+/backend/check_oss.py
+/backend/tests/output/
+/pytest-cache-files-*/
+/~$*.docx
+/;
+/\\;

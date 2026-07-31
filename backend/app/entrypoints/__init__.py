@@ -1,0 +1,2 @@
+"""FastAPI process-specific entrypoints."""
+

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.tmp/
+venv/
+.env
+logs/
+data/
+tests/
+diff_head.txt

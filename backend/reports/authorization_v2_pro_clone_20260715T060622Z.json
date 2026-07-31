@@ -1,0 +1,5 @@
+{
+  "mode": "migrate",
+  "status": "failed",
+  "error": "(pymysql.err.OperationalError) (1267, \"Illegal mix of collations (utf8mb4_unicode_ci,IMPLICIT) and (utf8mb4_0900_ai_ci,IMPLICIT) for operation '='\")\n[SQL: \n        INSERT INTO sys_assignments (workspace_id, user_id, position_id, is_primary, starts_at, status)\n        SELECT s.workspace_id, s.user_id, p.id, 1, NOW(), 1\n        FROM tmp_auth_user_signatures s JOIN sys_positions p\n          ON p.workspace_id = s.workspace_id AND p.org_unit_id = s.department_id\n         AND BINARY p.code = BINARY CONCAT('legacy-', MD5(s.role_signature))\n        WHERE NOT EXISTS (SELECT 1 FROM sys_assignments a WHERE a.workspace_id=s.workspace_id AND a.user_id=s.user_id)\n    ]\n(Background on this error at: https://sqlalche.me/e/20/e3q8)"
+}

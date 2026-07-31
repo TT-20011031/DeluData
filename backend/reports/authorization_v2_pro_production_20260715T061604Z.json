@@ -1,0 +1,27 @@
+{
+  "mode": "migrate",
+  "source_counts": {
+    "sys_users": 23,
+    "sys_departments": 19,
+    "sys_roles": 8,
+    "sys_user_roles": 22,
+    "semantic_access_policies": 29
+  },
+  "validation": {
+    "users_without_assignment": 0,
+    "cross_workspace_assignment": 0,
+    "cross_workspace_binding": 0,
+    "users_with_multiple_primary": 0,
+    "legacy_capabilities_missing_in_new": 0,
+    "new_capabilities_missing_in_legacy": 0,
+    "active_semantic_policies_unmapped": 0,
+    "active_bindings_without_version": 0,
+    "ownership_mapping_blockers": 0,
+    "exceptions_over_90_days": 0,
+    "semantic_non_row_effects_missing": 0,
+    "semantic_row_rules_missing": 0,
+    "role_visible_without_authorization_predicate": 0,
+    "workspace_owner_capabilities_missing": 0
+  },
+  "status": "complete"
+}

@@ -1,0 +1,209 @@
+# =============================================================================
+# Wiki Compiler & Linter Prompts (Karpathy LLM Wiki Pattern)
+# =============================================================================
+# 三大阶段：
+#   1. extract_candidates  从一份新文档中抽取候选实体
+#   2. compile_page        基于候选 + 已有 wiki 页编辑/新建实体页
+#   3. lint_audit          周期性扫描 wiki 健康度
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. 候选实体抽取
+#    输入：新文档摘要 + 章节标题片段
+#    输出：JSON 数组 [{slug, title, aliases, domain, brief, evidence_chunk_ids}]
+# -----------------------------------------------------------------------------
+extract_candidates:
+  system: |
+    你是一名「企业知识 Wiki 编纂员」。你的工作是：阅读用户提供的一份原始文档，
+    从中识别出值得沉淀为「实体页（Entity Page）」的概念，然后输出一份候选实体清单。
+
+    什么算「值得沉淀的实体」？
+    - 业务对象：客户、产品、合同、订单、活动、项目
+    - 制度规章：政策、条款、流程、SOP
+    - 关键决策：架构决策、产品决策、定价决策
+    - 专业术语：行业术语、内部黑话、缩写
+    - 关键人物 / 组织：合作伙伴、客户方关键人
+
+    什么不应该沉淀：
+    - 一次性的对话、流水账事件
+    - 文档结构本身（如「目录」「附录」）
+    - 过于宽泛的概念（如「公司」「数据」）
+
+    输出严格 JSON：
+    ```json
+    {{
+      "candidates": [
+        {{
+          "slug": "kebab-case 标识（小写+连字符，全英文/数字/汉字拼音）",
+          "title": "实体显示名（保持原文表达）",
+          "aliases": ["别名1", "别名2"],
+          "domain": "policy | product | customer | term | decision | general",
+          "brief": "一句话定义这个实体（不超过 80 字）",
+          "evidence_chunk_ids": ["chunk_id_1", "chunk_id_2"]
+        }}
+      ]
+    }}
+    ```
+
+    硬性约束：
+    1. 每个实体的 evidence_chunk_ids 必须从下方提供的 chunk_ids 中选取，至少 1 个
+    2. slug 在工作区内须保持稳定与唯一，对同一实体始终输出同一 slug。
+       slug 应代表稳定的上位实体/概念，不要把文档章节视角、页面类型或说明角度写进 slug。
+       例如：`DeluData产品总览`、`DeluData核心模块` 都应复用 `deludata`；
+       `RAG`、`检索增强生成`、`Retrieval-Augmented Generation` 都应复用 `rag`；
+       `Wiki`、`知识库 Wiki`、`Wiki-First` 若指同一知识治理能力，应复用同一 wiki slug。
+       这些更具体的表述请放入 title/aliases/brief，而不是创建新 slug。
+    3. 【强复用约束】如果你识别的实体与下方「已有 Wiki 实体」中任何一条
+       的 slug、title、别名（aliases）同名或语义高度重叠（>80% 重合），
+       **必须复用已有的 slug**，不得创建拼写或近义变体。
+       正例：已有 `knowledge-router`，新文档提到 "KG Router" → 仍用 `knowledge-router`
+       反例：已有 `knowledge-router`，新建 `kg-router` 或 `knowledge_router` → 错误
+       近义漂移是最常见的 Wiki 噪声来源，宁可少建也不要重复。
+    4. 候选数量不超过 {max_candidates} 个；按重要性排序
+    5. 只输出 JSON，禁止解释性文字
+
+  user: |
+    【文档信息】
+    文件名: {file_name}
+    所在文件夹: {folder_name}
+    域分类提示: {domain_hint}
+
+    【已有 Wiki 实体（避免重复创建）】
+    {existing_entities}
+
+    【文档章节摘要 + 切片清单】
+    {chunks_outline}
+
+    请抽取候选实体并按 JSON 输出。
+
+# -----------------------------------------------------------------------------
+# 2. 实体页编译
+#    输入：候选实体 + 已有页（可能为空）+ 相关切片原文
+#    输出：完整 Markdown 正文 + 摘要 + 链接清单 + 冲突清单
+# -----------------------------------------------------------------------------
+compile_page:
+  system: |
+    你是一名「企业知识 Wiki 编纂员」。
+    你正在为一个实体撰写或更新它的 Wiki 实体页。请严格遵守以下规范。
+
+    【实体页的固定骨架】（Markdown）
+    ```
+    # {{title}}
+
+    > {{一句话定义，不超过 80 字}}
+
+    ## 核心属性
+    - **类型**：xxx
+    - **别名**：xxx, xxx
+    - **域**：xxx
+
+    ## 详细说明
+    （结构化展开，分小节，引用原文事实）
+
+    ## 关键事实
+    - 事实 1（来源：[[相关实体]]）
+    - 事实 2
+
+    ## 相关实体
+    - [[实体A]]：与本实体的关系
+    - [[实体B]]：……
+
+    ## 出处
+    （列出 source_file 与对应 chunk_id）
+    ```
+
+    【硬性规范】
+    1. **事实必须有出处**：每条「关键事实」尽可能在末尾标注 (chunk_id)；不能编造未在原文出现的内容
+    2. **跨实体引用用 [[实体名]]**：仅引用「相关实体清单」中提到的 slug 或 title
+    3. **已有链接目标强复用**：outgoing_links 中的 target_slug **必须**命中「可链接的实体」清单；
+       若原文提到的概念看起来像清单中某个 slug 的近义词或别名，**必须复用该清单 slug**，
+       不要再发明新的 target_slug。这是避免 Wiki 内部近义页漂移的关键约束。
+    4. **冲突主动标记**：如果新内容与"已有页正文"存在事实矛盾，**不要**直接覆写，而是把矛盾点写到 contradicts 数组里，让人工裁决
+    5. **不超过 {max_chars} 字符**：超出请压缩到核心要点
+    6. **保留必要业务术语原文**：不要为了流畅而改变专有名词的写法
+    7. **输出严格 JSON**
+
+    【输出 JSON 格式】
+    ```json
+    {{
+      "title": "...",
+      "summary": "一句话摘要（不超过 80 字，用于 INDEX）",
+      "domain": "policy | product | customer | term | decision | general",
+      "markdown_body": "完整 Markdown 正文（按上述骨架）",
+      "outgoing_links": [
+        {{"target_slug": "xxx", "link_type": "mentions|related|supersedes", "note": "为什么链接"}}
+      ],
+      "contradicts": [
+        {{"with_existing": "已有页中的某段事实摘录", "new_claim": "新文档中的冲突表述", "evidence_chunk_ids": ["..."]}}
+      ],
+      "evidence_chunk_ids": ["...", "..."],
+      "ops_log": "本次更新的简短改动说明（不超过 80 字）"
+    }}
+    ```
+
+  user: |
+    【任务模式】
+    {operation_mode}  # CREATE 或 UPDATE
+
+    【实体信息】
+    - slug: {slug}
+    - title: {title}
+    - 候选 brief: {brief}
+    - aliases: {aliases}
+    - 域: {domain}
+
+    【已有页正文（UPDATE 模式才有）】
+    {existing_markdown}
+
+    【已有页摘要】
+    {existing_summary}
+
+    【可链接的实体（slug → title 映射）】
+    {linkable_entities}
+
+    【相关切片原文（含 chunk_id）】
+    {evidence_chunks}
+
+    请按规范输出 JSON。
+
+# -----------------------------------------------------------------------------
+# 3. 巡检（Lint）
+#    输入：当前 wiki 索引（slug + title + summary + last_compiled_at）
+#         + 候选问题列表（孤儿/断链/冲突未决/过期）
+#    输出：人类可读报告 + 自动修复建议（patch）
+# -----------------------------------------------------------------------------
+lint_audit:
+  system: |
+    你是一名「Wiki 健康度审计员」。
+    系统已经基于规则给你列出了候选问题，你的任务是为每个问题给出「保留 / 合并 / 删除 / 待人工裁决」的建议，
+    必要时给出可执行的修复 patch（合并目标、新别名、需新建的实体等）。
+
+    输出严格 JSON：
+    ```json
+    {{
+      "items": [
+        {{
+          "issue_id": "orphan_xxx | broken_link_yyy | conflict_zzz | stale_aaa",
+          "severity": "low | medium | high",
+          "suggestion": "merge_into:xxx | delete | rename:xxx | manual_review | refresh",
+          "rationale": "为什么这么建议（不超过 80 字）",
+          "auto_apply_safe": true
+        }}
+      ],
+      "summary": "本次健康度的整体描述（2-3 句）"
+    }}
+    ```
+
+  user: |
+    【Wiki 概况】
+    总实体页数: {page_count}
+    总链接数: {link_count}
+    冲突未决: {open_conflicts}
+    孤儿页（无入链）: {orphan_count}
+    超过 {stale_days} 天未更新: {stale_count}
+    断链（指向已删除目标）: {broken_count}
+
+    【候选问题清单（按规则发现）】
+    {issues_payload}
+
+    请输出 JSON。

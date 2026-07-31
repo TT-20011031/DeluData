@@ -1,0 +1,19 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="64" height="64" rx="18" fill="url(#bg)"/>
+  <path d="M20 14H34C42.8366 14 50 21.1634 50 30V34C50 42.8366 42.8366 50 34 50H20V14Z" fill="white" fill-opacity="0.12"/>
+  <path d="M22 18H33.5C40.4036 18 46 23.5964 46 30.5V33.5C46 40.4036 40.4036 46 33.5 46H22V18Z" fill="white"/>
+  <path d="M30 24C35.5228 24 40 28.4772 40 34C40 39.5228 35.5228 44 30 44H28V38.8H30C32.651 38.8 34.8 36.651 34.8 34C34.8 31.349 32.651 29.2 30 29.2H28V24H30Z" fill="url(#accent)"/>
+  <circle cx="45" cy="19" r="5" fill="#6EE7F9"/>
+  <path d="M43.5 19L45 15.8L46.5 19L49.7 20.5L46.5 22L45 25.2L43.5 22L40.3 20.5L43.5 19Z" fill="#FFF7ED"/>
+  <defs>
+    <linearGradient id="bg" x1="9" y1="6" x2="55" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0F172A"/>
+      <stop offset="0.55" stop-color="#1D4ED8"/>
+      <stop offset="1" stop-color="#0EA5E9"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="28" y1="24" x2="40" y2="44" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1D4ED8"/>
+      <stop offset="1" stop-color="#22D3EE"/>
+    </linearGradient>
+  </defs>
+</svg>

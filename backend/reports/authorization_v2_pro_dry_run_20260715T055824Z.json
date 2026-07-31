@@ -1,0 +1,20 @@
+{
+  "mode": "dry-run",
+  "source_counts": {
+    "sys_users": 23,
+    "sys_departments": 19,
+    "sys_roles": 8,
+    "sys_user_roles": 22,
+    "semantic_access_policies": 29
+  },
+  "active_semantic_subjects": {
+    "user": 1
+  },
+  "schema_sha256": "d54baccb14b5f579d62b7d3d8a9b98723c67b781acb643579a68c6c31ddbb754",
+  "required_gates": [
+    "database snapshot completed",
+    "ownership mappings present for organization-scoped semantic tables",
+    "zero unexplained functional capability differences",
+    "zero orphan or cross-workspace authorization rows"
+  ]
+}

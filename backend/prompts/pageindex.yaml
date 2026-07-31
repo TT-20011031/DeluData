@@ -1,0 +1,222 @@
+# PageIndex 提示词配置
+# 目标：将 core.py 中硬编码 Prompt 完全外置，统一通过 PromptManager 加载
+
+check_title_appearance: |
+  你是文档目录校验助手。
+  请判断“章节标题”是否在“页面文本”中出现，或是否在该页开始。
+  要求模糊匹配，忽略空格差异与轻微标点差异。
+
+  章节标题：
+  {title}
+
+  页面文本：
+  {page_text}
+
+  只返回 JSON 对象，包含字段：
+  - thinking: 判断依据（简短）
+  - answer: 只能是 yes 或 no
+
+check_title_appearance_in_start: |
+  你是文档目录校验助手。
+  请判断当前章节标题是否在页面开头开始。
+  若标题前仍有其他正文内容，则返回 no。
+  若标题是该页开头第一段核心内容，则返回 yes。
+  要求模糊匹配，忽略空格差异。
+
+  章节标题：
+  {title}
+
+  页面文本：
+  {page_text}
+
+  只返回 JSON 对象，包含字段：
+  - thinking: 判断依据（简短）
+  - start_begin: 只能是 yes 或 no
+
+toc_detector_single_page: |
+  你是目录页识别助手。
+  任务：判断给定文本是否为“目录（Table of Contents）页面”。
+
+  注意：
+  - Abstract / Summary / Notation List / Figure List / Table List 不是目录页
+  - 可使用模糊判断
+
+  页面文本：
+  {content}
+
+  只返回 JSON 对象，包含字段：
+  - thinking: 判断依据（简短）
+  - toc_detected: 只能是 yes 或 no
+
+check_toc_extraction_complete: |
+  你是目录完整性检查助手。
+  请判断给定“目录文本”是否已覆盖该“文档片段”的主要章节。
+
+  文档片段：
+  {content}
+
+  目录文本：
+  {toc}
+
+  只返回 JSON 对象，包含字段：
+  - thinking: 判断依据（简短）
+  - completed: 只能是 yes 或 no
+
+check_toc_transformation_complete: |
+  你是目录清洗完整性检查助手。
+  请判断“清洗后的目录”是否完整覆盖“原始目录”。
+
+  原始目录：
+  {raw_toc}
+
+  清洗后的目录：
+  {cleaned_toc}
+
+  只返回 JSON 对象，包含字段：
+  - thinking: 判断依据（简短）
+  - completed: 只能是 yes 或 no
+
+extract_toc_content: |
+  你是目录提取助手。
+  请从以下文本中提取完整目录内容。
+  要求将连续点线（例如 ......）统一替换为冒号。
+
+  输入文本：
+  {content}
+
+  只输出目录正文，不要输出解释文字。
+
+extract_toc_content_continue: |
+  请继续生成目录剩余部分。
+  只输出尚未生成的剩余文本，不要重复已输出内容，也不要添加解释。
+
+detect_page_index: |
+  你是目录页码识别助手。
+  请判断目录中是否包含页码（索引号）。
+
+  目录文本：
+  {toc_content}
+
+  只返回 JSON 对象，包含字段：
+  - thinking: 判断依据（简短）
+  - page_index_given_in_toc: 只能是 yes 或 no
+
+toc_index_extractor: |
+  你是目录物理页定位助手。
+  你会得到目录 JSON 和若干文档页面（页面内容包含 <physical_index_X> 标签）。
+  任务：仅为“当前页面中可确认出现”的目录项补充 physical_index。
+
+  目录 JSON：
+  {toc}
+
+  文档页面：
+  {content}
+
+  只返回 JSON 数组，每项包含：
+  - structure
+  - title
+  - physical_index（保持 <physical_index_X> 形式）
+  对无法确认的项，不要填写 physical_index。
+
+toc_transformer_init: |
+  你是目录结构化助手。
+  请将原始目录文本一次性转换为 JSON 结构，顶层字段名为 table_of_contents。
+
+  目录文本：
+  {toc_content}
+
+  只输出 JSON，不要解释。
+  table_of_contents 的每个元素需包含：
+  - structure: 层级编号（如 1 / 1.1 / 1.1.1，可为空）
+  - title: 标题
+  - page: 页码（整数或空）
+
+toc_transformer_continue: |
+  你需要继续补全目录 JSON。
+  请基于原始目录与当前不完整 JSON，继续输出“剩余的 JSON 片段”。
+  不要重复已生成部分，不要解释。
+
+  原始目录文本：
+  {toc_content}
+
+  当前不完整 JSON：
+  {partial_toc_json}
+
+add_page_number_to_toc: |
+  你是目录起始页定位助手。
+  给定目录结构与文档片段（包含 <physical_index_X> 标签），请判断每个目录项是否在该片段内开始。
+
+  文档片段：
+  {part}
+
+  目录结构：
+  {structure}
+
+  只返回 JSON 数组。每项字段：
+  - structure
+  - title
+  - start: yes 或 no
+  - physical_index: <physical_index_X> 或 null
+  注意：保留已存在结果，不要随意改写已确认项。
+
+generate_toc_continue: |
+  你是层级目录抽取助手。
+  请基于“上一段已生成树结构”与“当前文档片段”继续生成新增目录节点。
+  文本中使用 <physical_index_X> 标记页面范围。
+
+  当前文档片段：
+  {part}
+
+  上一段树结构：
+  {toc_content}
+
+  只输出新增节点的 JSON 数组，每项字段：
+  - structure
+  - title
+  - physical_index（保持 <physical_index_X>）
+
+generate_toc_init: |
+  你是层级目录抽取助手。
+  请从文档片段中初始化生成目录树节点。
+  文本中使用 <physical_index_X> 标记页面范围。
+
+  文档片段：
+  {part}
+
+  只输出 JSON 数组，每项字段：
+  - structure
+  - title
+  - physical_index（保持 <physical_index_X>）
+
+single_toc_item_index_fixer: |
+  你是目录单项修复助手。
+  给定章节标题和文档片段（包含 <physical_index_X> 标签），请找出该章节“开始页”的 physical_index。
+
+  章节标题：
+  {section_title}
+
+  文档片段：
+  {content}
+
+  只返回 JSON 对象，包含字段：
+  - thinking: 判断依据（简短）
+  - physical_index: <physical_index_X>
+
+generate_node_summary: |
+  你是文档节点摘要助手。
+  请阅读给定文档片段，提炼其核心信息，生成简洁摘要。
+
+  文档片段：
+  {node_text}
+
+  只输出摘要文本，不要输出解释、标题或额外标记。
+
+generate_doc_description: |
+  你是文档描述生成助手。
+  给定文档结构（包含标题与摘要等信息），请生成一句话文档描述，
+  便于把该文档与其他文档区分开。
+
+  文档结构：
+  {structure}
+
+  只输出一句描述，不要输出解释或其他文本。

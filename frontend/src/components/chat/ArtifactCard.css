@@ -1,0 +1,367 @@
+/**
+ * ArtifactCard 样式
+ */
+
+.artifact-card {
+    display: flex;
+    align-items: center;
+    padding: 12px 16px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    min-height: 56px;
+    background: var(--color-surface, #f8f9fa);
+    border: 1px solid var(--color-border, #e9ecef);
+}
+
+.artifact-card:hover {
+    background: var(--color-surface-hover, #f1f3f5);
+}
+
+/* 骨架屏状态 */
+.artifact-card--pending,
+.artifact-card--generating {
+    cursor: default;
+    background: linear-gradient(90deg,
+            var(--color-skeleton-base, rgba(0, 0, 0, 0.06)) 0%,
+            var(--color-skeleton-highlight, rgba(0, 0, 0, 0.1)) 50%,
+            var(--color-skeleton-base, rgba(0, 0, 0, 0.06)) 100%);
+    background-size: 200% 100%;
+    animation: skeleton-shimmer 1.5s ease-in-out infinite;
+}
+
+@keyframes skeleton-shimmer {
+    0% {
+        background-position: 200% 0;
+    }
+
+    100% {
+        background-position: -200% 0;
+    }
+}
+
+.artifact-card__skeleton {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+}
+
+.artifact-card__skeleton-icon {
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.artifact-card__spinner {
+    width: 24px;
+    height: 24px;
+    color: var(--color-primary, #4263eb);
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    from {
+        transform: rotate(0deg);
+    }
+
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.artifact-card__skeleton-text {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.artifact-card__skeleton-title {
+    height: 14px;
+    width: 60%;
+    background: rgba(0, 0, 0, 0.08);
+    border-radius: 4px;
+}
+
+.artifact-card__skeleton-subtitle {
+    height: 10px;
+    width: 40%;
+    background: rgba(0, 0, 0, 0.05);
+    border-radius: 4px;
+}
+
+/* 完成状态 */
+.artifact-card--completed {
+    background: var(--color-success-bg, #d3f9d8);
+    border-color: var(--color-success-border, #8ce99a);
+}
+
+.artifact-card--completed:hover {
+    background: var(--color-success-hover, #c0f2c5);
+}
+
+.artifact-card__content {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+}
+
+.artifact-card__icon {
+    width: 24px;
+    height: 24px;
+    color: var(--color-success, #40c057);
+}
+
+.artifact-card__info {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.artifact-card__title {
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--color-text, #212529);
+}
+
+.artifact-card__action {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--color-success, #40c057);
+}
+
+/* [P2] 图表完成状态：绿色 - 洞察与生长 */
+.artifact-card--chart.artifact-card--completed {
+    background: linear-gradient(135deg, #dcfce7, #bbf7d0);
+    border-color: #86efac;
+    border-left: 4px solid #22c55e;
+}
+
+.artifact-card--chart.artifact-card--completed:hover {
+    background: linear-gradient(135deg, #bbf7d0, #99f6a6);
+}
+
+.artifact-card--chart .artifact-card__icon {
+    color: #22c55e;
+}
+
+.artifact-card--chart .artifact-card__action {
+    color: #16a34a;
+}
+
+/* [P2] 文档完成状态：蓝色 - 沉淀与理性 */
+.artifact-card--doc.artifact-card--completed {
+    background: linear-gradient(135deg, #dbeafe, #bfdbfe);
+    border-color: #93c5fd;
+    border-left: 4px solid #3b82f6;
+}
+
+.artifact-card--doc.artifact-card--completed:hover {
+    background: linear-gradient(135deg, #bfdbfe, #a5d0fe);
+}
+
+.artifact-card--doc .artifact-card__icon {
+    color: #3b82f6;
+}
+
+.artifact-card--doc .artifact-card__action {
+    color: #2563eb;
+}
+
+/* 错误状态 */
+.artifact-card--error {
+    background: var(--color-error-bg, #ffe6e6);
+    border-color: var(--color-error-border, #ffa8a8);
+    cursor: default;
+}
+
+.artifact-card__error {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.artifact-card__icon--error {
+    color: var(--color-error, #fa5252);
+}
+
+.artifact-card__error-text {
+    font-size: 13px;
+    color: var(--color-error, #fa5252);
+}
+
+/* 暗色模式支持 - 使用 Tailwind 的 .dark 类 */
+.dark .artifact-card {
+    background: var(--color-surface-dark, #2c2c2c);
+    border-color: var(--color-border-dark, #404040);
+}
+
+.dark .artifact-card:hover {
+    background: var(--color-surface-hover-dark, #363636);
+}
+
+.dark .artifact-card--pending,
+.dark .artifact-card--generating {
+    background: linear-gradient(90deg,
+            rgba(255, 255, 255, 0.05) 0%,
+            rgba(255, 255, 255, 0.1) 50%,
+            rgba(255, 255, 255, 0.05) 100%);
+    background-size: 200% 100%;
+}
+
+.dark .artifact-card__skeleton-title,
+.dark .artifact-card__skeleton-subtitle {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.dark .artifact-card--completed {
+    background: rgba(64, 192, 87, 0.15);
+    border-color: rgba(64, 192, 87, 0.3);
+}
+
+.dark .artifact-card--error {
+    background: rgba(250, 82, 82, 0.15);
+    border-color: rgba(250, 82, 82, 0.3);
+}
+
+.dark .artifact-card__title {
+    color: #ffffff;
+}
+
+.dark .artifact-card__action {
+    color: #8ce99a;
+}
+
+.dark .artifact-card__error-text {
+    color: #ffa8a8;
+}
+
+/* [P2] 暗色模式 - 图表（绿色） */
+.dark .artifact-card--chart.artifact-card--completed {
+    background: rgba(34, 197, 94, 0.15);
+    border-color: rgba(34, 197, 94, 0.3);
+    border-left: 4px solid #22c55e;
+}
+
+.dark .artifact-card--chart .artifact-card__icon,
+.dark .artifact-card--chart .artifact-card__action {
+    color: #86efac;
+}
+
+/* [P2] 暗色模式 - 文档（蓝色） */
+.dark .artifact-card--doc.artifact-card--completed {
+    background: rgba(59, 130, 246, 0.15);
+    border-color: rgba(59, 130, 246, 0.3);
+    border-left: 4px solid #3b82f6;
+}
+
+.dark .artifact-card--doc .artifact-card__icon,
+.dark .artifact-card--doc .artifact-card__action {
+    color: #93c5fd;
+}
+
+/* 取消状态 - 灰色斜纹底色，区别于红色错误 */
+.artifact-card--cancelled {
+    background: repeating-linear-gradient(45deg,
+            var(--color-skeleton-base, #f1f3f5),
+            var(--color-skeleton-base, #f1f3f5) 8px,
+            var(--color-surface, #e9ecef) 8px,
+            var(--color-surface, #e9ecef) 16px);
+    border-color: var(--color-border, #dee2e6);
+    cursor: default;
+    opacity: 0.7;
+}
+
+.artifact-card__cancelled {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.artifact-card__icon--cancelled {
+    color: var(--color-text-muted, #868e96);
+}
+
+.artifact-card__cancelled-text {
+    font-size: 13px;
+    color: var(--color-text-muted, #868e96);
+}
+
+/* 暗色模式 cancelled */
+.dark .artifact-card--cancelled {
+    background: repeating-linear-gradient(45deg,
+            rgba(255, 255, 255, 0.05),
+            rgba(255, 255, 255, 0.05) 8px,
+            rgba(255, 255, 255, 0.08) 8px,
+            rgba(255, 255, 255, 0.08) 16px);
+    border-color: rgba(255, 255, 255, 0.15);
+}
+
+.dark .artifact-card__icon--cancelled,
+.dark .artifact-card__cancelled-text {
+    color: #adb5bd;
+}
+
+/* 数据无效状态 - 白天模式：浅灰背景+深色文字，黑夜模式：深色背景+亮色文字 */
+.artifact-card--invalid_data {
+    position: relative;
+    background: rgba(241, 245, 249, 0.92);
+    border-color: rgba(203, 213, 225, 0.9);
+    cursor: default;
+    min-height: 64px;
+    backdrop-filter: blur(4px);
+}
+
+.artifact-card__invalid {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    width: 100%;
+    padding: 8px 0;
+    animation: fadeIn 0.3s ease-out;
+}
+
+.artifact-card__invalid-badge {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    border: 1.5px solid rgba(100, 116, 139, 0.4);
+    background: rgba(255, 255, 255, 0.95);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #475569;
+    box-shadow: 0 2px 8px -2px rgba(0, 0, 0, 0.08);
+}
+
+.artifact-card__invalid-text {
+    font-size: 13px;
+    font-weight: 600;
+    color: #334155;
+    letter-spacing: 0.5px;
+}
+
+/* 暗色模式 invalid_data */
+.dark .artifact-card--invalid_data {
+    background: rgba(24, 24, 27, 0.92);
+    border-color: rgba(63, 63, 70, 0.7);
+}
+
+.dark .artifact-card__invalid-badge {
+    border-color: rgba(251, 191, 36, 0.5);
+    background: rgba(39, 39, 42, 0.95);
+    color: #fbbf24;
+}
+
+.dark .artifact-card__invalid-text {
+    color: #f1f5f9;
+}

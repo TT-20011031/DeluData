@@ -115,7 +115,7 @@ describe('knowledgePreviewService', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
-  it('upgrades cached same-host http preview URL to https on secure pages', async () => {
+  it('fetches a fresh PDF URL and upgrades same-host http to https on secure pages', async () => {
     vi.stubGlobal('window', {
       location: {
         protocol: 'https:',
@@ -124,26 +124,12 @@ describe('knowledgePreviewService', () => {
       },
     })
 
-    vi.doMock('@/lib/previewCache', () => ({
-      deleteCachedDocxPayload: vi.fn().mockResolvedValue(undefined),
-      getCachedDocxPayload: vi.fn().mockResolvedValue(null),
-      getCachedPreviewUrl: vi.fn().mockResolvedValue({
-        cacheKey: 'user:user_1:file_1:2026-03-11T12:00:00Z:raw',
-        userScope: 'user:user_1',
-        fileId: 'file_1',
-        updatedAt: '2026-03-11T12:00:00Z',
-        kind: 'raw',
-        url: 'http://agent.deluagent.com/api/knowledge/files/file_1/raw',
-        requiresAuth: true,
-        expiresAt: null,
-        createdAt: 1,
-        lastAccessedAt: 1,
-      }),
-      setCachedDocxPayload: vi.fn().mockResolvedValue(undefined),
-      setCachedPreviewUrl: vi.fn().mockResolvedValue(undefined),
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(buildJsonResponse({
+      url: 'http://agent.deluagent.com/api/knowledge/files/file_1/raw',
+      requires_auth: true,
+      kind: 'raw',
+      expires_at: null,
     }))
-
-    const fetchMock = vi.fn<typeof fetch>()
     vi.stubGlobal('fetch', fetchMock)
 
     const { resolvePdfPreviewAccess } = await import('@/services/knowledgePreviewService')
@@ -161,6 +147,6 @@ describe('knowledgePreviewService', () => {
       kind: 'raw',
       expires_at: null,
     })
-    expect(fetchMock).not.toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })

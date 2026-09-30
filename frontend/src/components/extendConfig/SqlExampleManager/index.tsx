@@ -6,7 +6,7 @@
 import { useState, useCallback } from 'react'
 import {
     Code, Plus, RefreshCw, FolderPlus,
-    Trash2, Loader2, CheckSquare, Square
+    Trash2, Loader2, CheckSquare, Square, ShieldCheck
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -16,6 +16,8 @@ import { SqlExampleList } from './SqlExampleList'
 import { SqlExampleDialog } from './SqlExampleDialog'
 import { SqlGroupDialog } from './SqlGroupDialog'
 import { BatchMoveDialog } from './BatchMoveDialog'
+import { SqlExampleAuditDialog } from './SqlExampleAuditDialog'
+import { useAuthStore } from '@/stores/authStore'
 import {
     EMPTY_SQL_EXAMPLE_FORM,
     EMPTY_SQL_GROUP_FORM,
@@ -25,6 +27,8 @@ import {
 } from '@/types/extendConfig'
 
 export function SqlExampleManager() {
+    const currentUser = useAuthStore(state => state.user)
+    const canAudit = currentUser?.permissions?.some(code => code === '*' || code === 'config:manage') || false
     const {
         examples,
         groups,
@@ -58,6 +62,7 @@ export function SqlExampleManager() {
     const [batchMoveTargetId, setBatchMoveTargetId] = useState<number | null>(null)
     const [isBatchMoving, setIsBatchMoving] = useState(false)
     const [isBatchDeleting, setIsBatchDeleting] = useState(false)
+    const [showAuditDialog, setShowAuditDialog] = useState(false)
 
     const confirmDialog = useConfirmDialog()
 
@@ -77,17 +82,23 @@ export function SqlExampleManager() {
             description: example.description || '',
             tables: example.tables || '',
             group_id: example.group_id,
+            parameters: example.parameters || [],
+            is_active: example.is_active,
         })
         setShowExampleDialog(true)
     }, [])
 
     // 保存示例
-    const handleSaveExample = useCallback(async () => {
-        if (!exampleForm.question.trim() || !exampleForm.sql.trim()) {
+    const handleSaveExample = useCallback(async (
+        activate = false,
+        overrideForm?: SqlExampleForm,
+    ) => {
+        const payload = overrideForm || exampleForm
+        if (!payload.question.trim() || !payload.sql.trim()) {
             confirmDialog.showError('问题描述和示例 SQL 不能为空')
             return
         }
-        const success = await saveExample(editingExampleId, exampleForm)
+        const success = await saveExample(editingExampleId, { ...payload, is_active: activate })
         if (success) {
             setShowExampleDialog(false)
         }
@@ -176,6 +187,16 @@ export function SqlExampleManager() {
                         </CardDescription>
                     </div>
                     <div className="flex gap-2">
+                        {canAudit && (
+                            <Button
+                                variant="outline"
+                                onClick={() => setShowAuditDialog(true)}
+                                className="bg-manus-tertiary border-manus-border hover:bg-manus-hover text-manus-text"
+                            >
+                                <ShieldCheck className="h-4 w-4 mr-2" />
+                                账号审计
+                            </Button>
+                        )}
                         <Button
                             variant="outline"
                             onClick={refresh}
@@ -302,6 +323,11 @@ export function SqlExampleManager() {
                 onTargetChange={setBatchMoveTargetId}
                 onConfirm={handleBatchMove}
                 isMoving={isBatchMoving}
+            />
+
+            <SqlExampleAuditDialog
+                open={showAuditDialog}
+                onClose={() => setShowAuditDialog(false)}
             />
 
             <ConfirmDialog

@@ -9,12 +9,13 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from sqlalchemy import create_engine, inspect, select, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import get_current_user
 from app.core.db.database import get_async_db_manager
+from app.core.db.mysql_connection_policy import create_mysql_engine
 from app.core.security.auth import User
 from app.models.auth.organization import DepartmentModel
 from app.models.auth.rbac import RoleModel, UserModel
@@ -65,6 +66,7 @@ class ConnectResponse(BaseModel):
 class SchemaResponse(BaseModel):
     database: str
     tables: list[TableSchema]
+    table_names: list[str] = []
 
 
 class TableDataRequest(BaseModel):
@@ -310,15 +312,36 @@ def get_table_schema(engine, table_name: str) -> TableSchema:
             }
         )
 
-    row_count = None
+    # Row counts are intentionally omitted here. COUNT(*) can scan entire large
+    # tables and made opening the database page block unrelated API requests.
+    return TableSchema(name=table_name, columns=columns, row_count=None)
+
+
+def _test_connection_sync(connection_url: str) -> None:
+    engine = create_mysql_engine(connection_url, pool_pre_ping=True, pool_size=1)
     try:
         with engine.connect() as conn:
-            result = conn.execute(text(f"SELECT COUNT(*) FROM `{table_name}`"))
-            row_count = result.scalar()
-    except Exception:
-        pass
+            conn.execute(text("SELECT 1"))
+    finally:
+        engine.dispose()
 
-    return TableSchema(name=table_name, columns=columns, row_count=row_count)
+
+def _load_table_names_sync(connection_url: str) -> list[str]:
+    engine = create_mysql_engine(connection_url, pool_pre_ping=True, pool_size=1)
+    try:
+        return get_table_list(engine)
+    finally:
+        engine.dispose()
+
+
+def _load_schema_sync(connection_url: str, limit: int = 50) -> tuple[list[str], list[TableSchema]]:
+    engine = create_mysql_engine(connection_url, pool_pre_ping=True, pool_size=5)
+    try:
+        table_names = get_table_list(engine)
+        schema = [get_table_schema(engine, name) for name in table_names[:limit]]
+        return table_names, schema
+    finally:
+        engine.dispose()
 
 
 def _quote_identifier(identifier: str) -> str:
@@ -513,15 +536,9 @@ async def connect_database(request: ConnectRequest, current_user: User = Depends
     if block:
         return block
 
-    engine = None
     try:
         url = build_connection_url(request)
-        engine = create_engine(url, pool_pre_ping=True, pool_size=1)
-
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-
-        tables = get_table_list(engine)
+        tables = await asyncio.to_thread(_load_table_names_sync, url)
 
         config = UserDBConfig(
             user_id=current_user.id,
@@ -553,9 +570,6 @@ async def connect_database(request: ConnectRequest, current_user: User = Depends
         logger.error("Database connect failed: %s", exc)
         code, message = classify_connect_error(exc, request.database)
         return connect_error_response(code, message)
-    finally:
-        if engine is not None:
-            engine.dispose()
 
 
 @router.post("/test")
@@ -571,18 +585,12 @@ async def test_database_connection(request: ConnectRequest, current_user: User =
     if block:
         return block
 
-    engine = None
     try:
-        engine = create_engine(build_connection_url(request), pool_pre_ping=True, pool_size=1)
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
+        await asyncio.to_thread(_test_connection_sync, build_connection_url(request))
         return {"status": "success", "message": "测试连接成功"}
     except SQLAlchemyError as exc:
         code, message = classify_connect_error(exc, request.database)
         return connect_error_response(code, message)
-    finally:
-        if engine is not None:
-            engine.dispose()
 
 
 @router.post("/disconnect")
@@ -624,19 +632,16 @@ async def get_connection_status(current_user: User = Depends(get_current_user)):
         # Keep status endpoint backward compatible: treat blocked endpoint as disconnected.
         return DBConnectionStatus(is_connected=False, **capabilities)
 
+    # Keep status checks fast. Full schema discovery belongs to /db/schema and
+    # may take a long time for large external databases.
     tables = []
-    try:
-        if _is_admin_user(current_user) and not await authorization_v2_is_active():
-            engine = create_engine(config.get_connection_url(), pool_pre_ping=True, pool_size=1)
-            tables = get_table_list(engine)
-            engine.dispose()
-        else:
-            tables = []
+    if not _is_admin_user(current_user):
+        try:
             semantic_schema = await _get_member_semantic_schema(current_user)
             if semantic_schema:
                 tables = [table.name for table in semantic_schema]
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     return DBConnectionStatus(
         is_connected=True,
@@ -666,18 +671,17 @@ async def get_database_schema(current_user: User = Depends(get_current_user)):
         return block
 
     try:
-        engine = create_engine(config.get_connection_url(), pool_pre_ping=True, pool_size=5)
         if _is_admin_user(current_user) and not await authorization_v2_is_active():
-            table_names = get_table_list(engine)
-            tables = [get_table_schema(engine, name) for name in table_names[:50]]
+            table_names, tables = await asyncio.to_thread(_load_schema_sync, config.get_connection_url())
         else:
             semantic_schema = await _get_member_semantic_schema(current_user)
             if semantic_schema:
                 tables = semantic_schema[:50]
+                table_names = [table.name for table in semantic_schema]
             else:
                 tables = []
-        engine.dispose()
-        return SchemaResponse(database=config.database, tables=tables)
+                table_names = []
+        return SchemaResponse(database=config.database, tables=tables, table_names=table_names)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取 Schema 失败: {str(e)}")
 
@@ -700,9 +704,7 @@ async def get_tables(current_user: User = Depends(get_current_user)):
 
     try:
         if _is_admin_user(current_user) and not await authorization_v2_is_active():
-            engine = create_engine(config.get_connection_url(), pool_pre_ping=True, pool_size=1)
-            tables = get_table_list(engine)
-            engine.dispose()
+            tables = await asyncio.to_thread(_load_table_names_sync, config.get_connection_url())
         else:
             semantic_schema = await _get_member_semantic_schema(current_user)
             if semantic_schema:
@@ -740,7 +742,11 @@ async def get_user_engine(user_id: str):
             raise PermissionError(DBWhitelistService.BLOCKED_CODE)
 
         connection_url = config.get_connection_url()
-        return create_engine(connection_url, pool_pre_ping=True, pool_size=5)
+        return create_mysql_engine(
+            connection_url,
+            pool_pre_ping=True,
+            pool_size=5,
+        )
     except PermissionError:
         raise
     except Exception as e:
@@ -796,7 +802,11 @@ async def configure_readonly_account(
             f"mysql+pymysql://{request.readonly_username}:{request.readonly_password}"
             f"@{config.host}:{config.port}/{config.database}"
         )
-        engine = create_engine(readonly_url, pool_pre_ping=True, pool_size=1)
+        engine = create_mysql_engine(
+            readonly_url,
+            pool_pre_ping=True,
+            pool_size=1,
+        )
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         engine.dispose()

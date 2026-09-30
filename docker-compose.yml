@@ -12,6 +12,7 @@ x-backend-common: &backend-common
     DB_NAME: ${DB_NAME:-DeluData}
     REDIS_HOST: ${REDIS_HOST:-redis}
     REDIS_PORT: ${REDIS_PORT:-6379}
+    SEMANTIC_ACCESS_EVIDENCE_AUTO_REGENERATE_ON_SEMANTIC_CHANGE: "false"
   restart: unless-stopped
   volumes:
     - backend_data:/app/data
@@ -189,6 +190,40 @@ services:
       redis:
         condition: service_healthy
 
+  knowledge-mcp-nbu:
+    <<: *backend-common
+    image: deludata_pro-knowledge-mcp
+    container_name: knowledge-mcp-nbu-pro
+    command: python -m app.mcp.knowledge_server
+    env_file:
+      - ${BACKEND_ENV_FILE:-./backend/.env}
+      - ${MCP_NBU_ENV_FILE:-./backend/.env}
+    environment:
+      DB_HOST: ${DB_HOST:-mysql}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_USER: ${DB_USER:-root}
+      DB_PASSWORD: ${DB_PASSWORD:-rootpassword}
+      DB_NAME: ${DB_NAME:-DeluData}
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      MCP_KNOWLEDGE_WORKSPACE_ID: 772bf740-71c5-4192-8694-36dfc8329388
+      MCP_KNOWLEDGE_USER_ID: 103d4aab-c0c1-4fc6-a8b4-2b8e982cd0fc
+      MCP_KNOWLEDGE_ROLE: admin
+      MCP_KNOWLEDGE_DEPT_ID: "40"
+      MCP_KNOWLEDGE_VISIBILITY: private
+      MCP_KNOWLEDGE_TRANSPORT: http
+      MCP_KNOWLEDGE_HTTP_HOST: 0.0.0.0
+      MCP_KNOWLEDGE_HTTP_PORT: "8020"
+      MCP_KNOWLEDGE_ALLOWED_ORIGINS: https://agent.pro.deluagent.com
+      MCP_KNOWLEDGE_ALLOW_LOCAL_PATHS: "false"
+    expose:
+      - "8020"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   frontend-admin:
     container_name: frontend-admin-pro
     build:
@@ -222,6 +257,7 @@ services:
       - admin-backend
       - experience-backend
       - knowledge-mcp
+      - knowledge-mcp-nbu
       - frontend-admin
       - frontend-experience
       - frontend-platform

@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-SQL_EXAMPLES_COLLECTION = "sql_examples_v2"
+SQL_EXAMPLES_COLLECTION = "sql_examples_v3"
 SQL_EXAMPLES_SYNC_BATCH_SIZE = 32
 
 _chroma_client: Optional[chromadb.ClientAPI] = None
@@ -67,8 +67,16 @@ def _example_chroma_id(example_id: int) -> str:
     return f"example_{example_id}"
 
 
-def _build_sql_example_text(question: str, description: str = "") -> str:
-    parts = [str(question or "").strip(), str(description or "").strip()]
+def _build_sql_example_text(
+    question: str,
+    description: str = "",
+    normalized_question: str = "",
+) -> str:
+    parts = [
+        str(question or "").strip(),
+        str(normalized_question or "").strip(),
+        str(description or "").strip(),
+    ]
     return "\n".join(part for part in parts if part).strip()
 
 
@@ -78,26 +86,33 @@ def _build_sql_example_metadata(
     question: str,
     sql: str,
     workspace_id: str,
+    owner_id: str,
     description: str = "",
     tables: str = "",
     is_active: bool = True,
+    validation_status: str = "draft",
+    normalized_question: str = "",
 ) -> Dict[str, Any]:
     return {
         "id": str(example_id),
         "workspace_id": str(workspace_id),
-        "sql": str(sql or ""),
+        "owner_id": str(owner_id),
         "tables": str(tables or ""),
         "question": str(question or ""),
         "description": str(description or ""),
         "is_active": bool(is_active),
+        "validation_status": str(validation_status),
+        "normalized_question": str(normalized_question or ""),
     }
 
 
-def _search_where_filter(workspace_id: str) -> Dict[str, Any]:
+def _search_where_filter(workspace_id: str, owner_id: str) -> Dict[str, Any]:
     return {
         "$and": [
             {"workspace_id": {"$eq": str(workspace_id)}},
+            {"owner_id": {"$eq": str(owner_id)}},
             {"is_active": {"$eq": True}},
+            {"validation_status": {"$eq": "valid"}},
         ]
     }
 
@@ -131,12 +146,15 @@ async def add_sql_example_embedding(
     question: str,
     sql: str,
     workspace_id: str,
+    owner_id: str,
     description: str = "",
     tables: str = "",
     is_active: bool = True,
+    validation_status: str = "draft",
+    normalized_question: str = "",
 ) -> bool:
     """添加 SQL 示例向量。"""
-    text = _build_sql_example_text(question, description)
+    text = _build_sql_example_text(question, description, normalized_question)
     success = await _upsert_sql_example_records(
         [
             {
@@ -147,9 +165,12 @@ async def add_sql_example_embedding(
                     question=question,
                     sql=sql,
                     workspace_id=workspace_id,
+                    owner_id=owner_id,
                     description=description,
                     tables=tables,
                     is_active=is_active,
+                    validation_status=validation_status,
+                    normalized_question=normalized_question,
                 ),
             }
         ]
@@ -164,9 +185,12 @@ async def update_sql_example_embedding(
     question: str,
     sql: str,
     workspace_id: str,
+    owner_id: str,
     description: str = "",
     tables: str = "",
     is_active: bool = True,
+    validation_status: str = "draft",
+    normalized_question: str = "",
 ) -> bool:
     """更新 SQL 示例向量。"""
     success = await add_sql_example_embedding(
@@ -174,9 +198,12 @@ async def update_sql_example_embedding(
         question=question,
         sql=sql,
         workspace_id=workspace_id,
+        owner_id=owner_id,
         description=description,
         tables=tables,
         is_active=is_active,
+        validation_status=validation_status,
+        normalized_question=normalized_question,
     )
     if success:
         logger.info("SQL 示例向量更新成功: id=%s, active=%s", example_id, is_active)
@@ -215,6 +242,7 @@ async def batch_delete_sql_example_embeddings(example_ids: List[int]) -> bool:
 async def _load_sql_examples_by_ids(
     example_ids: List[int],
     workspace_id: str,
+    owner_id: str,
     *,
     active_only: bool,
 ) -> Dict[int, "SqlExample"]:
@@ -230,9 +258,13 @@ async def _load_sql_examples_by_ids(
         stmt = select(SqlExampleModel).where(
             SqlExampleModel.id.in_(example_ids),
             SqlExampleModel.workspace_id == workspace_id,
+            SqlExampleModel.created_by == owner_id,
         )
         if active_only:
-            stmt = stmt.where(SqlExampleModel.is_active.is_(True))
+            stmt = stmt.where(
+                SqlExampleModel.is_active.is_(True),
+                SqlExampleModel.validation_status == "valid",
+            )
 
         result = await session.execute(stmt)
         rows = result.scalars().all()
@@ -240,9 +272,95 @@ async def _load_sql_examples_by_ids(
     return {int(row.id): SqlExample.from_orm(row) for row in rows}
 
 
+async def _find_exact_sql_example(
+    question: str,
+    workspace_id: str,
+    owner_id: str,
+) -> Optional["SqlExample"]:
+    from sqlalchemy import or_, select
+    from app.core.db.database import get_async_db_context
+    from app.models.config.sql_example import SqlExample, SqlExampleModel
+
+    async with get_async_db_context() as session:
+        row = (
+            await session.execute(
+                select(SqlExampleModel).where(
+                    SqlExampleModel.workspace_id == workspace_id,
+                    SqlExampleModel.created_by == owner_id,
+                    SqlExampleModel.is_active.is_(True),
+                    SqlExampleModel.validation_status == "valid",
+                    or_(
+                        SqlExampleModel.question == question,
+                        SqlExampleModel.normalized_question == question,
+                    ),
+                ).order_by(SqlExampleModel.updated_at.desc()).limit(1)
+            )
+        ).scalar_one_or_none()
+    return SqlExample.from_orm(row) if row is not None else None
+
+
+async def _find_parameterized_sql_example(
+    question: str,
+    workspace_id: str,
+    owner_id: str,
+) -> Optional["SqlExample"]:
+    """Deterministically match the static skeleton of a parameterized example."""
+
+    import re
+    from sqlalchemy import select
+    from app.core.db.database import get_async_db_context
+    from app.models.config.sql_example import SqlExample, SqlExampleModel
+
+    async with get_async_db_context() as session:
+        rows = (
+            await session.execute(
+                select(SqlExampleModel).where(
+                    SqlExampleModel.workspace_id == workspace_id,
+                    SqlExampleModel.created_by == owner_id,
+                    SqlExampleModel.is_active.is_(True),
+                    SqlExampleModel.validation_status == "valid",
+                    SqlExampleModel.normalized_question.contains("{{"),
+                ).order_by(SqlExampleModel.updated_at.desc())
+            )
+        ).scalars().all()
+
+    query = re.sub(r"\s+", "", str(question or "").lower())
+    best: Optional[tuple[int, SqlExample]] = None
+    for row in rows:
+        template = str(row.normalized_question or row.question or "").lower()
+        labels = {
+            str(item.get("label") or "").strip().lower()
+            for item in (row.parameters_json or [])
+            if str(item.get("label") or "").strip()
+        }
+        for label in labels:
+            template = re.sub(rf"(\}}\}}){re.escape(label)}", r"\1", template)
+            template = re.sub(rf"{re.escape(label)}(\{{\{{)", r"\1", template)
+        pieces = [
+            re.sub(r"\s+", "", item)
+            for item in re.split(r"\{\{[^{}]+\}\}", template)
+            if re.sub(r"\s+", "", item)
+        ]
+        static_length = sum(len(item) for item in pieces)
+        if static_length < 4:
+            continue
+        position = 0
+        matched = True
+        for piece in pieces:
+            index = query.find(piece, position)
+            if index < 0:
+                matched = False
+                break
+            position = index + len(piece)
+        if matched and (best is None or static_length > best[0]):
+            best = (static_length, SqlExample.from_orm(row))
+    return best[1] if best else None
+
+
 async def search_sql_examples_by_similarity(
     question: str,
     workspace_id: str,
+    owner_id: str,
     threshold: Optional[float] = None,
     n_results: int = 1,
 ) -> List[Tuple["SqlExample", float]]:
@@ -255,6 +373,14 @@ async def search_sql_examples_by_similarity(
         settings = get_settings()
         threshold = float(getattr(settings.supervisor, "sql_example_threshold", 0.7))
 
+    exact_example = await _find_exact_sql_example(query, workspace_id, owner_id)
+    if exact_example is not None:
+        return [(exact_example, 1.0)]
+
+    parameterized_example = await _find_parameterized_sql_example(query, workspace_id, owner_id)
+    if parameterized_example is not None:
+        return [(parameterized_example, 0.99)]
+
     collection = get_sql_examples_collection()
     embedding_client = get_async_embedding()
 
@@ -264,7 +390,7 @@ async def search_sql_examples_by_similarity(
             collection.query,
             query_embeddings=[query_embedding],
             n_results=max(1, int(n_results)),
-            where=_search_where_filter(workspace_id),
+            where=_search_where_filter(workspace_id, owner_id),
             include=["metadatas", "distances"],
         )
     except Exception as exc:
@@ -302,7 +428,12 @@ async def search_sql_examples_by_similarity(
         logger.info("SQL 示例匹配: 用户问题='%s...' -> 无有效结果", query[:30])
         return []
 
-    example_map = await _load_sql_examples_by_ids(candidate_ids, workspace_id, active_only=True)
+    example_map = await _load_sql_examples_by_ids(
+        candidate_ids,
+        workspace_id,
+        owner_id,
+        active_only=True,
+    )
 
     matches: List[Tuple["SqlExample", float]] = []
     for example_id, similarity, _preview in ranked_candidates:
@@ -449,15 +580,22 @@ async def sync_all_sql_examples_to_vector(
         payloads = [
             {
                 "chroma_id": _example_chroma_id(int(example.id or 0)),
-                "text": _build_sql_example_text(example.question, example.description or ""),
+                "text": _build_sql_example_text(
+                    example.question,
+                    example.description or "",
+                    example.normalized_question,
+                ),
                 "metadata": _build_sql_example_metadata(
                     example_id=int(example.id or 0),
                     question=example.question,
                     sql=example.sql,
                     workspace_id=example.workspace_id,
+                    owner_id=example.created_by,
                     description=example.description or "",
                     tables=example.tables or "",
                     is_active=bool(example.is_active),
+                    validation_status=example.validation_status,
+                    normalized_question=example.normalized_question,
                 ),
             }
             for example in batch

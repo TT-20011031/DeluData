@@ -6,9 +6,10 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, Optional
 
-from sqlalchemy import create_engine, inspect, select
+from sqlalchemy import inspect, select
 
 from app.core.db.database import get_async_db_manager
+from app.core.db.mysql_connection_policy import create_mysql_engine
 from app.models.config.db_config import (
     UserDBConfig,
     get_user_db_config_async,
@@ -48,7 +49,12 @@ class SemanticGovernanceService:
         return config
 
     def inspect_snapshot(self, config: UserDBConfig) -> dict[str, Any]:
-        engine = create_engine(config.get_connection_url(), pool_pre_ping=True, pool_size=1)
+        connection_url = config.get_connection_url()
+        engine = create_mysql_engine(
+            connection_url,
+            pool_pre_ping=True,
+            pool_size=1,
+        )
         try:
             inspector = inspect(engine)
             table_items: list[dict[str, Any]] = []

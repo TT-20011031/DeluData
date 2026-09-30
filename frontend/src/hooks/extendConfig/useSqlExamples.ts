@@ -173,17 +173,15 @@ export function useSqlExamples(): UseSqlExamplesReturn {
     const toggleActive = useCallback(async (example: SqlExample): Promise<void> => {
         try {
             await extendConfigService.toggleSqlExampleActive(example.id, !example.is_active)
-            // 乐观更新
-            setExamples(prev => prev.map(e =>
-                e.id === example.id ? { ...e, is_active: !e.is_active } : e
-            ))
+            // 启用时后端会重新执行权限校验，以服务端状态为准。
+            await loadData()
         } catch (error) {
             toast({
                 type: 'error',
                 title: '更新状态失败',
             })
         }
-    }, [toast])
+    }, [loadData, toast])
 
     // 批量删除
     const batchDelete = useCallback(async (): Promise<boolean> => {

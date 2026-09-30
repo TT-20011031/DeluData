@@ -8,13 +8,202 @@ from app.services.semantic_access_bootstrap_service import (
     _evidence_baseline_access,
     _evidence_field_access,
     _evidence_table_access,
+    _merge_table_definition,
+    _review_published_tables,
+    _row_ownership_generation_summary,
 )
+from app.services import semantic_access_bootstrap_service as bootstrap_module
 from app.entrypoints.semantic_access_bootstrap_worker import SemanticAccessBootstrapWorker
-from app.services.semantic_policy_binding_service import _prepare_definition_v3
+from app.services.semantic_policy_binding_service import (
+    _build_organization_condition,
+    _prepare_definition_v3,
+)
 
 
 def _service() -> SemanticAccessBootstrapService:
     return SemanticAccessBootstrapService.__new__(SemanticAccessBootstrapService)
+
+
+@pytest.mark.asyncio
+async def test_target_draft_includes_effective_inherited_tables(monkeypatch):
+    inherited = [{
+        "table_id": 1,
+        "decision": "visible",
+        "hidden_column_ids": [3],
+        "hidden_metric_ids": [],
+        "row_scope": {"type": "all"},
+        "is_direct_override": False,
+        "source": "org_unit",
+        "sources": [{
+            "binding_id": 8,
+            "target_type": "org_unit",
+            "target_id": "22",
+            "label": "生产部",
+        }],
+        "override_seed": {
+            "table_id": 1,
+            "decision": "visible",
+            "hidden_column_ids": [3],
+            "hidden_metric_ids": [],
+            "row_scope": {"type": "all"},
+        },
+    }]
+
+    draft_definition = {"name": "生产部", "tables": [{
+        "table_id": 1,
+        "decision": "visible",
+        "hidden_column_ids": [3],
+        "hidden_metric_ids": [],
+        "row_scope": {"type": "all"},
+    }]}
+
+    class Result:
+        def __init__(self, *, rows=None, single=None):
+            self.rows = rows or []
+            self.single = single
+
+        def scalar_one_or_none(self):
+            return self.single
+
+        def scalars(self):
+            return self.rows
+
+    class Session:
+        def __init__(self):
+            self.execute_count = 0
+
+        async def execute(self, _query):
+            self.execute_count += 1
+            if self.execute_count == 1:
+                return Result(rows=[SimpleNamespace(
+                    target_type="org_unit",
+                    target_id="22",
+                    definition_json=draft_definition,
+                )])
+            return Result(single=None)
+
+    class SessionScope:
+        async def __aenter__(self):
+            return Session()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Database:
+        def session_scope(self):
+            return SessionScope()
+
+    captured = {}
+
+    async def effective_context(*_args, **kwargs):
+        captured.update(kwargs)
+        return {"effective": {1: inherited[0]}}
+
+    service = _service()
+
+    async def allow(*_args, **_kwargs):
+        return None
+
+    async def run(*_args, **_kwargs):
+        return SimpleNamespace(id=12, datasource_id=1, status="review_ready")
+
+    async def label(*_args, **_kwargs):
+        return "生产部经理"
+
+    async def snapshot(*_args, **_kwargs):
+        return None, {"name": "生产部经理", "tables": []}, None
+
+    service._assert_workspace_manage = allow
+    service._run = run
+    service._resolve_target_label = label
+    service._binding_snapshot = snapshot
+    service._run_payload = lambda current: {"run_id": current.id}
+    monkeypatch.setattr(bootstrap_module, "get_async_db_manager", lambda: Database())
+    monkeypatch.setattr(bootstrap_module, "_effective_policy_context", effective_context)
+
+    result = await service.get_target_draft(
+        "workspace-1", 12, "position", "10", "admin-1",
+    )
+
+    assert result["target"]["definition"]["tables"] == []
+    assert result["effective_tables"] == inherited
+    assert captured["definition_overrides"] == {
+        ("org_unit", "22"): draft_definition,
+    }
+
+
+def test_single_table_publish_preserves_other_active_rules():
+    active = {
+        "name": "生产部",
+        "tables": [
+            {"table_id": 1, "decision": "visible", "hidden_column_ids": [11]},
+            {"table_id": 2, "decision": "visible", "hidden_column_ids": []},
+        ],
+    }
+    draft = {
+        "name": "生产部",
+        "tables": [
+            {"table_id": 1, "decision": "visible", "hidden_column_ids": []},
+            {"table_id": 3, "decision": "visible", "hidden_column_ids": []},
+        ],
+    }
+
+    merged = _merge_table_definition(active, draft, 1)
+
+    assert merged["tables"] == [
+        {"table_id": 1, "decision": "visible", "hidden_column_ids": []},
+        {"table_id": 2, "decision": "visible", "hidden_column_ids": []},
+    ]
+
+
+def test_single_table_publish_can_remove_an_active_rule():
+    active = {"name": "生产部", "tables": [
+        {"table_id": 1, "decision": "visible"},
+        {"table_id": 2, "decision": "visible"},
+    ]}
+
+    merged = _merge_table_definition(active, {"name": "生产部", "tables": []}, 1)
+
+    assert merged["tables"] == [{"table_id": 2, "decision": "visible"}]
+
+
+def test_published_table_review_state_reflects_manual_edits():
+    candidates = [{
+        "table_id": 1,
+        "selected": True,
+        "decision": "visible",
+        "hidden_column_ids": [12],
+        "hidden_metric_ids": [],
+        "row_scope": "all",
+        "review_state": "pending",
+        "field_suggestions": [
+            {"column_id": 11, "effective_decision": "visible", "review_state": "pending"},
+            {"column_id": 12, "effective_decision": "hidden", "review_state": "pending"},
+        ],
+    }]
+    edited_rule = {
+        "table_id": 1,
+        "decision": "visible",
+        "hidden_column_ids": [],
+        "hidden_metric_ids": [],
+        "row_scope": {"type": "all"},
+    }
+
+    reviewed = _review_published_tables(candidates, {1: edited_rule}, {1})
+
+    assert reviewed[0]["review_state"] == "modified"
+    assert reviewed[0]["field_suggestions"][0]["review_state"] == "accepted"
+    assert reviewed[0]["field_suggestions"][1]["review_state"] == "modified"
+
+
+def test_row_ownership_generation_summary_prefers_v2_and_reads_v1():
+    assert _row_ownership_generation_summary({
+        "row_ownership_v1": {"version": 1, "candidates": ["legacy"]},
+        "row_ownership_v2": {"version": 2, "candidates": ["current"]},
+    }) == {"version": 2, "candidates": ["current"]}
+    assert _row_ownership_generation_summary({
+        "row_ownership_v1": {"version": 1, "candidates": ["legacy"]},
+    }) == {"version": 1, "candidates": ["legacy"]}
 
 
 def _table(*, sensitive: bool = False) -> SimpleNamespace:
@@ -390,6 +579,394 @@ def test_direct_draft_keeps_row_scope_only_for_visible_tables():
 
     assert rule["decision"] == "visible"
     assert rule["row_scope"] == {"type": "target_org"}
+
+
+def test_direct_draft_preserves_unowned_access_marker():
+    service = _service()
+
+    rule = service._rule_from_candidate({
+        "table_id": 11,
+        "selected": True,
+        "decision": "visible",
+        "hidden_column_ids": [],
+        "hidden_metric_ids": [],
+        "row_scope": {
+            "type": "target_org_tree",
+            "unowned_access": "table_grantees",
+        },
+    })
+
+    assert rule["row_scope"] == {
+        "type": "target_org_tree",
+        "unowned_access": "table_grantees",
+    }
+
+
+def test_complete_ownership_domain_becomes_explicit_department_conditions():
+    service = _service()
+    mapping = SimpleNamespace(
+        proposed_mapping_json={
+            "org_column_id": 72,
+            "org_value_kind": "external",
+            "org_value_mapping": {
+                "bindings": [
+                    {
+                        "source_type": "string",
+                        "source_value": "生产部",
+                        "target_kind": "org_unit",
+                        "org_unit_id": 22,
+                    },
+                    {
+                        "source_type": "string",
+                        "source_value": "制造中心",
+                        "target_kind": "org_unit",
+                        "org_unit_id": 22,
+                    },
+                ],
+            },
+        },
+        validation_json={
+            "blockers": [],
+            "unresolved_values": [],
+            "null_rows": 0,
+            "empty_rows": 0,
+            "source_values": [
+                {"source_type": "string", "source_value": "生产部"},
+                {"source_type": "string", "source_value": "制造中心"},
+            ],
+        },
+    )
+
+    assert service._row_scope_suggestions_from_mapping(mapping) == {
+        "22": {
+            "type": "custom",
+            "condition": {
+                "column_id": 72,
+                "operator": "in",
+                "value": ["生产部", "制造中心"],
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize("validation_patch", [
+    {"null_rows": 1},
+    {"empty_rows": 1},
+    {"unresolved_values": [{"source_type": "string", "source_value": "未知部门"}]},
+])
+def test_incomplete_ownership_domain_keeps_full_table_visibility(validation_patch):
+    service = _service()
+    validation = {
+        "blockers": [],
+        "unresolved_values": [],
+        "null_rows": 0,
+        "empty_rows": 0,
+        "source_values": [{"source_type": "string", "source_value": "生产部"}],
+        **validation_patch,
+    }
+    mapping = SimpleNamespace(
+        proposed_mapping_json={
+            "org_column_id": 72,
+            "org_value_kind": "external",
+            "org_value_mapping": {
+                "bindings": [{
+                    "source_type": "string",
+                    "source_value": "生产部",
+                    "target_kind": "org_unit",
+                    "org_unit_id": 22,
+                }],
+            },
+        },
+        validation_json=validation,
+    )
+
+    assert service._row_scope_suggestions_from_mapping(mapping) == {}
+
+
+def test_row_scope_suggestion_is_embedded_only_in_matching_department():
+    service = _service()
+
+    def target(target_type: str, target_id: str, selected: bool):
+        candidate = {
+            "table_id": 6,
+            "selected": selected,
+            "decision": "visible" if selected else "hidden",
+            "hidden_column_ids": [],
+            "hidden_metric_ids": [],
+            "row_scope": {"type": "all"},
+            "confidence": 1.0,
+        }
+        return SimpleNamespace(
+            target_type=target_type,
+            target_id=target_id,
+            target_label=target_id,
+            candidates_json=[candidate],
+            definition_json={
+                "tables": [service._rule_from_candidate(candidate)],
+            },
+            included=True,
+            status="proposed",
+            edited_by=None,
+        )
+
+    production = target("org_unit", "22", True)
+    finance = target("org_unit", "23", True)
+    mapping = SimpleNamespace(
+        id=3,
+        table_id=6,
+        confidence=0.95,
+        proposed_mapping_json={
+            "org_column_id": 72,
+            "org_value_kind": "external",
+            "org_value_mapping": {
+                "bindings": [{
+                    "source_type": "string",
+                    "source_value": "生产部",
+                    "target_kind": "org_unit",
+                    "org_unit_id": 22,
+                }],
+            },
+        },
+        validation_json={
+            "blockers": [],
+            "unresolved_values": [],
+            "null_rows": 0,
+            "empty_rows": 0,
+            "source_values": [{"source_type": "string", "source_value": "生产部"}],
+            "grant_snapshot": {
+                "baseline_visible": False,
+                "explicit_org_unit_ids": [22, 23],
+                "scoped_org_unit_ids": [22, 23],
+            },
+        },
+    )
+
+    assert service._embed_mapping_row_scope_suggestion(
+        [production, finance],
+        mapping,
+        actor_id="admin",
+    ) is True
+    production_rule = production.definition_json["tables"][0]
+    assert production_rule["row_scope"] == {
+        "type": "custom",
+        "condition": {
+            "column_id": 72,
+            "operator": "=",
+            "value": "生产部",
+        },
+    }
+    assert production.candidates_json[0]["row_scope_suggestion"] is True
+    assert production.candidates_json[0]["confidence"] == 0.95
+    assert finance.definition_json["tables"][0]["row_scope"] == {"type": "all"}
+    assert "row_scope_suggestion" not in finance.candidates_json[0]
+
+
+@pytest.mark.asyncio
+async def test_external_organization_condition_includes_owned_and_unowned_rows():
+    class FakeSession:
+        async def get(self, _model, _column_id):
+            return SimpleNamespace(data_type="varchar(64)")
+
+    mapping = SimpleNamespace(
+        org_column_id=101,
+        org_value_kind="external",
+        org_value_mapping_json={
+            "bindings": [
+                {
+                    "source_type": "string",
+                    "source_value": "Sales",
+                    "target_kind": "org_unit",
+                    "org_unit_id": 7,
+                },
+                {
+                    "source_type": "string",
+                    "source_value": "Sales child",
+                    "target_kind": "org_unit",
+                    "org_unit_id": 8,
+                },
+                {
+                    "source_type": "string",
+                    "source_value": "Legacy unassigned",
+                    "target_kind": "unowned",
+                    "manual_unowned": True,
+                },
+            ],
+        },
+    )
+
+    condition = await _build_organization_condition(
+        FakeSession(),
+        "workspace",
+        mapping,
+        [7, 8],
+        {"type": "target_org_tree", "unowned_access": "table_grantees"},
+    )
+
+    assert condition["op"] == "OR"
+    assert condition["_organization_scope"]["unowned_access"] == "table_grantees"
+    assert condition["rules"] == [
+        {"column_id": 101, "operator": "in", "value": ["Sales", "Sales child"]},
+        {"column_id": 101, "operator": "is null"},
+        {"column_id": 101, "operator": "=", "value": ""},
+        {"column_id": 101, "operator": "in", "value": ["Legacy unassigned"]},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_integer_organization_condition_does_not_treat_zero_as_unowned():
+    class FakeSession:
+        async def get(self, _model, _column_id):
+            return SimpleNamespace(data_type="bigint")
+
+    mapping = SimpleNamespace(
+        org_column_id=101,
+        org_value_kind="id",
+        org_value_mapping_json={},
+    )
+
+    condition = await _build_organization_condition(
+        FakeSession(),
+        "workspace",
+        mapping,
+        [7, 8],
+        {"type": "target_org_tree", "unowned_access": "table_grantees"},
+    )
+
+    assert condition["rules"] == [
+        {"column_id": 101, "operator": "in", "value": [7, 8]},
+        {"column_id": 101, "operator": "is null"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_accepting_mapping_replaces_baseline_with_department_scoped_rules():
+    service = _service()
+
+    def target(target_type: str, target_id: str, selected: bool):
+        candidate = {
+            "table_id": 11,
+            "selected": selected,
+            "decision": "visible" if selected else "hidden",
+            "hidden_column_ids": [],
+            "hidden_metric_ids": [],
+            "row_scope": {"type": "all"},
+        }
+        return SimpleNamespace(
+            target_type=target_type,
+            target_id=target_id,
+            target_label=target_id,
+            candidates_json=[candidate],
+            definition_json={
+                "tables": [service._rule_from_candidate(candidate)] if selected else [],
+            },
+            included=selected,
+            status="proposed",
+            edited_by=None,
+        )
+
+    targets = [
+        target("baseline", "*", True),
+        target("org_unit", "7", False),
+        target("org_unit", "8", False),
+    ]
+
+    class FakeResult:
+        def scalars(self):
+            return targets
+
+    class FakeSession:
+        async def execute(self, _query):
+            return FakeResult()
+
+    mapping = SimpleNamespace(
+        table_id=11,
+        validation_json={
+            "grant_snapshot": {
+                "baseline_visible": True,
+                "explicit_org_unit_ids": [],
+                "scoped_org_unit_ids": [7, 8],
+            },
+        },
+    )
+
+    await service._apply_mapping_scope_decision(
+        FakeSession(),
+        SimpleNamespace(id=1),
+        mapping,
+        accepted=True,
+        actor_id="admin",
+    )
+
+    assert targets[0].definition_json["tables"] == []
+    for department_target in targets[1:]:
+        assert department_target.definition_json["tables"][0]["row_scope"] == {
+            "type": "target_org_tree",
+            "unowned_access": "table_grantees",
+        }
+
+
+@pytest.mark.asyncio
+async def test_rejecting_mapping_preserves_original_full_table_grants():
+    service = _service()
+    candidate = {
+        "table_id": 11,
+        "selected": False,
+        "decision": "hidden",
+        "hidden_column_ids": [],
+        "hidden_metric_ids": [],
+        "row_scope": {"type": "target_org_tree", "unowned_access": "table_grantees"},
+    }
+    baseline = SimpleNamespace(
+        target_type="baseline",
+        target_id="*",
+        target_label="baseline",
+        candidates_json=[candidate.copy()],
+        definition_json={"tables": []},
+        included=False,
+        status="edited",
+        edited_by=None,
+    )
+    department = SimpleNamespace(
+        target_type="org_unit",
+        target_id="7",
+        target_label="Sales",
+        candidates_json=[candidate.copy()],
+        definition_json={"tables": []},
+        included=False,
+        status="edited",
+        edited_by=None,
+    )
+    targets = [baseline, department]
+
+    class FakeResult:
+        def scalars(self):
+            return targets
+
+    class FakeSession:
+        async def execute(self, _query):
+            return FakeResult()
+
+    mapping = SimpleNamespace(
+        table_id=11,
+        validation_json={
+            "grant_snapshot": {
+                "baseline_visible": True,
+                "explicit_org_unit_ids": [],
+                "scoped_org_unit_ids": [7],
+            },
+        },
+    )
+
+    await service._apply_mapping_scope_decision(
+        FakeSession(),
+        SimpleNamespace(id=1),
+        mapping,
+        accepted=False,
+        actor_id="admin",
+    )
+
+    assert baseline.definition_json["tables"][0]["row_scope"] == {"type": "all"}
+    assert department.definition_json["tables"] == []
 
 
 def test_existing_direct_draft_removes_only_invalid_hidden_row_scopes():

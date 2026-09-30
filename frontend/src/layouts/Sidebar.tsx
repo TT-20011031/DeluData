@@ -21,7 +21,7 @@ const navItems = [
     { path: '/', icon: MessageSquare, label: '对话', requiredPermissions: ['chat:use'] },
     { path: '/knowledge', icon: FolderOpen, label: '知识库', requiredPermissions: ['knowledge:view', 'knowledge:manage'] },
     { path: '/database', icon: Database, label: '数据库', requiredPermissions: ['database:view', 'database:query'] },
-    { path: '/extend-config', icon: Settings2, label: '扩展配置', requiredPermissions: ['config:view', 'config:manage'] },
+    { path: '/extend-config', icon: Settings2, label: '扩展配置', requiredPermissions: ['database:query', 'config:manage'] },
     { path: '/agent-config', icon: Bot, label: '智能体配置', requiredPermissions: ['config:view', 'config:manage'] },
     { path: '/extend-scenes', icon: Sparkles, label: '扩展场景', requiredPermissions: ['museum:guide', 'museum:shop'] },
 ]

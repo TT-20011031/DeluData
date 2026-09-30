@@ -4,6 +4,52 @@ import type {
     SemanticAccessRowScope,
     SemanticAccessTableRule,
 } from '@/types/extendConfig'
+import type {
+    SemanticAccessPolicySourceSummary,
+    SemanticAccessTargetType,
+    SemanticEffectiveTableRule,
+} from '@/features/semanticAccess/types'
+
+export function bootstrapEffectiveRules(
+    effectiveRules: SemanticEffectiveTableRule[] | undefined,
+    activeRules: SemanticAccessTableRule[],
+): SemanticEffectiveTableRule[] {
+    if (effectiveRules !== undefined) return effectiveRules
+    return activeRules.map(rule => ({
+        ...rule,
+        is_direct_override: true,
+        source: 'direct',
+        sources: [],
+        override_seed: { ...rule },
+    }))
+}
+
+export function persistedSemanticAccessTableRule(
+    tableId: number,
+    activeRules: SemanticAccessTableRule[],
+    effectiveRules: SemanticEffectiveTableRule[],
+) {
+    const directRule = activeRules.find(item => item.table_id === tableId)
+    const effectiveRule = effectiveRules.find(item => item.table_id === tableId)
+    return {
+        rule: directRule || effectiveRule,
+        direct: Boolean(directRule),
+        effectiveRule,
+    }
+}
+
+export function semanticAccessDecisionOriginLabel(
+    targetType: SemanticAccessTargetType,
+    isDirect: boolean,
+    sources: SemanticAccessPolicySourceSummary[] = [],
+): string {
+    if (isDirect) return '本级决策'
+    const labels = [...new Set(sources.map(item => item.label).filter(Boolean))]
+    if (labels.length > 0) return `跟随${labels.join('、')}决策`
+    return targetType === 'baseline'
+        ? '默认拒绝'
+        : '跟随上级决策（默认拒绝）'
+}
 
 function normalizeValue(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(normalizeValue)

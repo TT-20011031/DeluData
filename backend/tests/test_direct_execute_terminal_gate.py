@@ -117,3 +117,32 @@ async def test_chart_only_allows_when_only_knowledge_source_available(monkeypatc
 
     assert output["plan_status"] == "completed"
     assert output["task_plan"][0]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_direct_sql_execution_passes_current_question_as_original_query(monkeypatch):
+    observed = {}
+
+    class FakeWorker:
+        async def execute_task(self, **kwargs):
+            observed.update(kwargs)
+            return {"success": True, "row_count": 1, "data": [{"ok": 1}], "columns": ["ok"], "artifacts": {}}
+
+        @staticmethod
+        def format_result_for_synthesizer(result):
+            return "ok"
+
+    monkeypatch.setattr(direct_execute_module, "get_sql_worker", lambda: FakeWorker())
+
+    await direct_execute_module._execute_worker(
+        worker_type="sql_worker",
+        query="按月统计销售金额趋势",
+        user_context={"user_id": "u1", "workspace_id": "w1"},
+        session_id="s1",
+        parent_step_id="step-1",
+        memory_dfs={},
+        round_index=0,
+    )
+
+    assert observed["task_description"] == "按月统计销售金额趋势"
+    assert observed["original_query"] == "按月统计销售金额趋势"

@@ -1,10 +1,10 @@
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useEffect } from 'react'
 import { Navigate, useSearchParams } from 'react-router-dom'
 import { Settings2, Code, FileText, BookOpen, Palette } from 'lucide-react'
 import { Tabs, TabsContent } from '@/components/ui/tabs'
 import { StyledTabsNav, type StyledTabItem } from '@/components/ui/styled-tabs'
 import { useAuthStore } from '@/stores/authStore'
-import { SqlExampleManager, TemplateManager, SkillManager, DocStyleManager } from '@/components/extendConfig'
+import { SqlExampleAuditOnly, SqlExampleManager, TemplateManager, SkillManager, DocStyleManager } from '@/components/extendConfig'
 
 export default function ExtendConfigPage() {
     const { user: currentUser } = useAuthStore()
@@ -13,6 +13,9 @@ export default function ExtendConfigPage() {
     // 从 URL 参数获取 tab，默认为 'sql'
     const defaultTab = searchParams.get('tab') || 'sql'
     const [activeTab, setActiveTab] = useState(defaultTab)
+    const permissions = currentUser?.permissions || []
+    const canManageConfig = permissions.some((code) => code === '*' || code === 'config:manage')
+    const canQueryDatabase = permissions.some((code) => code === '*' || code === 'database:query')
 
     // 当 activeTab 改变时更新 URL
     useEffect(() => {
@@ -22,18 +25,24 @@ export default function ExtendConfigPage() {
         }, { replace: true })
     }, [activeTab, setSearchParams])
 
+    useEffect(() => {
+        if (!canManageConfig && activeTab !== 'sql') {
+            setActiveTab('sql')
+        }
+    }, [activeTab, canManageConfig])
+
     // 权限检查
-    if (!currentUser?.permissions?.some((code) => code === '*' || code === 'config:manage')) {
+    if (!canManageConfig && !canQueryDatabase) {
         return <Navigate to="/" replace />
     }
 
-    const tabItems: StyledTabItem[] = useMemo(() => [
+    const tabItems: StyledTabItem[] = [
         {
             value: 'sql',
             label: 'SQL 示例',
             icon: <Code className="h-4 w-4" />,
         },
-        {
+        ...(canManageConfig ? [{
             value: 'templates',
             label: '模板管理',
             icon: <FileText className="h-4 w-4" />,
@@ -47,8 +56,8 @@ export default function ExtendConfigPage() {
             value: 'doc-styles',
             label: '文档样式',
             icon: <Palette className="h-4 w-4" />,
-        },
-    ], [])
+        }] : []),
+    ]
 
     return (
         <div className="flex-1 h-full min-h-0 bg-manus overflow-y-auto p-6">
@@ -61,7 +70,9 @@ export default function ExtendConfigPage() {
                             扩展配置
                         </h1>
                         <p className="text-manus-muted mt-1">
-                            管理 SQL 示例、文档模板、DeluSkills 和文档样式
+                            {canManageConfig
+                                ? '管理 SQL 示例、文档模板、DeluSkills 和文档样式'
+                                : '维护仅供当前账号使用的 SQL 示例'}
                         </p>
                     </div>
                 </div>
@@ -74,20 +85,24 @@ export default function ExtendConfigPage() {
                     />
 
                     <TabsContent value="sql" className="mt-6">
-                        <SqlExampleManager />
+                        {canQueryDatabase ? <SqlExampleManager /> : <SqlExampleAuditOnly />}
                     </TabsContent>
 
-                    <TabsContent value="templates" className="mt-6">
-                        <TemplateManager />
-                    </TabsContent>
+                    {canManageConfig && (
+                        <>
+                            <TabsContent value="templates" className="mt-6">
+                                <TemplateManager />
+                            </TabsContent>
 
-                    <TabsContent value="skills" className="mt-6">
-                        <SkillManager />
-                    </TabsContent>
+                            <TabsContent value="skills" className="mt-6">
+                                <SkillManager />
+                            </TabsContent>
 
-                    <TabsContent value="doc-styles" className="mt-6">
-                        <DocStyleManager />
-                    </TabsContent>
+                            <TabsContent value="doc-styles" className="mt-6">
+                                <DocStyleManager />
+                            </TabsContent>
+                        </>
+                    )}
                 </Tabs>
             </div>
         </div>

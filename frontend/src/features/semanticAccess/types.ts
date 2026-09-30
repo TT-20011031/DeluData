@@ -1,4 +1,4 @@
-import type { SemanticAccessTableRule } from '@/types/extendConfig'
+import type { SemanticAccessRowScope, SemanticAccessTableRule } from '@/types/extendConfig'
 
 export type SemanticAccessTargetType = 'baseline' | 'org_unit' | 'position' | 'user'
 
@@ -9,6 +9,7 @@ export type SemanticAccessTargetSummary = {
   binding_id: number | null
   revision: number
   configured: boolean
+  direct_override_count?: number
   include_descendants: boolean
   affected_user_count: number
   has_explicit_deny: boolean
@@ -133,9 +134,11 @@ export type SemanticAccessBootstrapCandidate = {
   confidence: number
   confidence_level: 'high' | 'medium' | 'low'
   reason: string
-  row_scope: 'all' | 'target_org_tree' | null
+  row_scope: 'all' | 'target_org' | 'target_org_tree' | SemanticAccessRowScope | null
   requires_mapping: boolean
   has_mapping_proposal: boolean
+  row_scope_suggestion?: boolean
+  row_scope_suggestion_id?: number
   sensitive: boolean
   hidden_column_ids: number[]
   hidden_metric_ids: number[]
@@ -191,12 +194,22 @@ export type SemanticAccessBootstrapMapping = {
   base_mapping: Record<string, unknown>
   proposed_mapping: {
     org_column_id?: number | null
-    org_value_kind?: 'id' | 'code'
+    org_value_kind?: 'id' | 'code' | 'external'
+    org_value_mapping?: SemanticOrganizationValueMapping
     user_column_id?: number | null
     user_value_kind?: 'id' | 'username'
   }
   evidence: string[]
-  validation: { blockers?: SemanticAccessBootstrapIssue[]; warnings?: SemanticAccessBootstrapIssue[] }
+  validation: {
+    blockers?: SemanticAccessBootstrapIssue[]
+    warnings?: SemanticAccessBootstrapIssue[]
+    total_rows?: number
+    null_rows?: number
+    empty_rows?: number
+    source_values?: SemanticOrganizationSourceValue[]
+    unresolved_values?: SemanticOrganizationSourceValue[]
+    source_domain_fingerprint?: string
+  }
   updated_at?: string
 }
 
@@ -251,6 +264,50 @@ export type SemanticAccessBinding = {
   revision: number
   status: boolean
   affected_user_count?: number
+  effective_tables?: SemanticEffectiveTableRule[]
+}
+
+export type SemanticAccessPolicySourceSummary = {
+  binding_id: number
+  target_type: SemanticAccessTargetType
+  target_id: string
+  label: string
+}
+
+export type SemanticEffectiveTableRule = SemanticAccessTableRule & {
+  is_direct_override: boolean
+  source: SemanticAccessTargetType | 'direct' | 'default_deny'
+  sources: SemanticAccessPolicySourceSummary[]
+  override_seed: SemanticAccessTableRule
+}
+
+export type SemanticAccessSimilarSuggestionCandidate = {
+  candidate_id: string
+  table_id: number
+  table_name: string
+  matched_fields: string[]
+  adjustments: string[]
+  apply_status: 'direct' | 'review'
+  expands_access: boolean
+  default_selected: boolean
+}
+
+export type SemanticAccessSimilarSuggestionPreview = {
+  batch_fingerprint: string
+  binding_revision: number
+  active_version_id: number
+  bootstrap_revision: number | null
+  schema_fingerprint: string | null
+  candidates: SemanticAccessSimilarSuggestionCandidate[]
+}
+
+export type SemanticAccessSimilarSuggestionApplyResult = {
+  binding_revision: number
+  active_version_id: number
+  bootstrap_revision: number | null
+  direct_table_ids: number[]
+  review_table_ids: number[]
+  audit_id: number
 }
 
 export type SemanticAccessValidationIssue = {
@@ -261,9 +318,32 @@ export type SemanticAccessValidationIssue = {
 export type SemanticOwnershipMapping = {
   table_id: number
   org_column_id: number | null
-  org_value_kind: 'id' | 'code'
+  org_value_kind: 'id' | 'code' | 'external'
+  org_value_mapping?: SemanticOrganizationValueMapping
   user_column_id: number | null
   user_value_kind: 'id' | 'username'
+}
+
+export type SemanticOrganizationSourceValue = {
+  source_type: 'string' | 'integer'
+  source_value: string | number
+  row_count?: number
+}
+
+export type SemanticOrganizationValueBinding = SemanticOrganizationSourceValue & {
+  target_kind: 'org_unit' | 'unowned'
+  org_unit_id?: number | null
+  confidence?: number
+  match_method?: string
+  reason?: string
+  manual_unowned?: boolean
+  manual_reason?: string
+}
+
+export type SemanticOrganizationValueMapping = {
+  version?: number
+  bindings?: SemanticOrganizationValueBinding[]
+  source_domain_fingerprint?: string
 }
 
 export type SemanticPolicySource = {

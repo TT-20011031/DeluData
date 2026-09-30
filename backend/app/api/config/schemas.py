@@ -4,7 +4,7 @@
 SQL 示例和模板管理的请求/响应模型
 """
 from typing import List, Dict, Any, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # ========== SQL 示例相关 ==========
@@ -18,6 +18,14 @@ class SqlExampleResponse(BaseModel):
     tables: str | None
     is_active: bool
     group_id: int | None = None
+    owner_id: str | None = None
+    validation_status: str = "draft"
+    validation_errors: List[Dict[str, Any]] = Field(default_factory=list)
+    parameters: List[Dict[str, Any]] = Field(default_factory=list)
+    normalized_question: str = ""
+    validated_at: str | None = None
+    last_matched_at: str | None = None
+    match_count: int = 0
     created_at: str
     updated_at: str
 
@@ -26,6 +34,24 @@ class SqlExampleListResponse(BaseModel):
     """SQL 示例列表响应"""
     examples: List[SqlExampleResponse]
     total: int
+
+
+class SqlExampleValidationRequest(BaseModel):
+    question: str
+    sql: str
+    parameters: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class SqlExampleValidationResponse(BaseModel):
+    status: str
+    errors: List[Dict[str, Any]]
+    parameters: List[Dict[str, Any]]
+    normalized_question: str
+    preview_sql: str = ""
+
+
+class SqlExampleOwnerClaimRequest(BaseModel):
+    owner_id: str
 
 
 class SqlGroupResponse(BaseModel):

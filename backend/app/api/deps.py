@@ -123,6 +123,24 @@ async def get_current_admin(current_user: User = Depends(get_current_user)) -> U
     return current_user
 
 
+async def get_current_query_user(current_user: User = Depends(get_current_user)) -> User:
+    """Require the ordinary read-only data-query capability."""
+
+    allowed = current_user.capability_scopes.get("database:query")
+    denied = current_user.denied_capability_scopes.get("database:query")
+    if (
+        "database:query" not in current_user.permissions
+        or allowed is None
+        or allowed == []
+        or denied == "*"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="database_query_permission_required",
+        )
+    return current_user
+
+
 def get_user_context(current_user: User = Depends(get_current_user)) -> UserContext:
     return UserContext(
         user_id=current_user.id,

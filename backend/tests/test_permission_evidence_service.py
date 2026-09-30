@@ -1,3 +1,4 @@
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -14,6 +15,9 @@ from app.services.organization_semantic_service import (
 from app.services.permission_evidence_service import (
     PermissionEvidenceError,
     PermissionEvidenceService,
+    _ownership_candidate_metadata,
+    _ownership_candidate_thresholds,
+    _ownership_value_confidence,
     access_level_from_legacy,
     baseline_access_from_legacy,
     filter_enabled_evidence_items,
@@ -35,8 +39,232 @@ def _profile_service() -> OrganizationSemanticService:
     return object.__new__(OrganizationSemanticService)
 
 
+def test_semantic_change_does_not_auto_regenerate_access_evidence_by_default():
+    service = _evidence_service()
+    service.settings = SimpleNamespace(
+        semantic_access_evidence=SimpleNamespace(
+            auto_regenerate_on_semantic_change=False,
+        ),
+    )
+
+    class UnexpectedDatabaseSession:
+        async def execute(self, *_args, **_kwargs):
+            raise AssertionError("disabled auto-regeneration must not touch evidence state")
+
+    changed = asyncio.run(service.enqueue_if_ready_in_session(
+        UnexpectedDatabaseSession(),
+        "workspace-1",
+        1,
+        "actor-1",
+    ))
+
+    assert changed is False
+
+
 def test_stable_fingerprint_is_key_order_independent():
     assert stable_fingerprint({"b": 2, "a": [1]}) == stable_fingerprint({"a": [1], "b": 2})
+
+
+def _ownership_column(name: str, **patch):
+    return SimpleNamespace(
+        physical_name=name,
+        business_name=patch.pop("business_name", name),
+        synonyms=patch.pop("synonyms", []),
+        description=patch.pop("description", ""),
+        physical_comment=patch.pop("physical_comment", ""),
+        data_type=patch.pop("data_type", "varchar(64)"),
+        **patch,
+    )
+
+
+@pytest.mark.parametrize(("name", "expected_tier"), [
+    ("所属机构编码", "strong"),
+    ("business_unit_id", "expanded"),
+    ("responsible_branch_code", "expanded"),
+    ("门店编号", "expanded"),
+    ("科室ID", "expanded"),
+    ("owning_team_key", "expanded"),
+    ("department_id", "strong"),
+])
+def test_row_ownership_metadata_scoring_recalls_common_org_units(name, expected_tier):
+    result = _ownership_candidate_metadata(_ownership_column(name))
+
+    assert result is not None
+    assert result["candidate_tier"] == expected_tier
+    assert result["metadata_score"] >= 4
+    assert result["matched_signals"]
+
+
+@pytest.mark.parametrize("name", [
+    "customer_org_id",
+    "supplier_company_id",
+    "region_id",
+    "created_by",
+    "owner_user_id",
+    "branch_manager_id",
+    "warehouse_unit_id",
+    "measurement_unit_id",
+    "original_status",
+])
+def test_row_ownership_metadata_scoring_rejects_non_internal_dimensions(name):
+    assert _ownership_candidate_metadata(_ownership_column(name)) is None
+
+
+def test_row_ownership_description_needs_independent_structural_ownership_signal():
+    assert _ownership_candidate_metadata(_ownership_column(
+        "status_code", description="按部门统计状态",
+    )) is None
+
+    result = _ownership_candidate_metadata(_ownership_column(
+        "owner_key", description="数据归属机构",
+    ))
+    assert result is not None
+    assert result["candidate_tier"] == "expanded"
+
+
+def test_row_ownership_tiers_use_separate_automatic_thresholds():
+    policy = SimpleNamespace(
+        candidate_confidence=0.90,
+        candidate_margin=0.15,
+        expanded_candidate_confidence=0.95,
+        expanded_candidate_margin=0.20,
+        value_confidence=0.90,
+        expanded_value_confidence=0.95,
+    )
+
+    assert _ownership_candidate_thresholds(policy, "strong") == (0.90, 0.15)
+    assert _ownership_candidate_thresholds(policy, "expanded") == (0.95, 0.20)
+    assert _ownership_value_confidence(policy, "strong") == 0.90
+    assert _ownership_value_confidence(policy, "expanded") == 0.95
+
+
+def test_row_ownership_profile_only_auto_excludes_null_and_exact_empty_string():
+    class FakeExecutor:
+        calls = 0
+
+        def execute_query(self, _sql, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(
+                    error=None,
+                    columns=["total_rows", "null_rows", "empty_rows"],
+                    rows=[(8, 2, 1)],
+                )
+            return SimpleNamespace(
+                error=None,
+                rows=[("   ", 2), ("0", 1), ("UNKNOWN", 2)],
+            )
+
+    profile = PermissionEvidenceService._profile_ownership_values_sync(
+        FakeExecutor(),
+        SimpleNamespace(physical_name="orders"),
+        SimpleNamespace(physical_name="department_code", data_type="varchar(64)"),
+        max_distinct_values=10,
+        timeout_sec=5,
+    )
+
+    assert profile["status"] == "complete"
+    assert profile["null_rows"] == 2
+    assert profile["empty_rows"] == 1
+    assert [row["source_value"] for row in profile["source_values"]] == [
+        "   ", "0", "UNKNOWN",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_row_ownership_maps_unique_department_name_as_external_value():
+    service = _evidence_service()
+    service.settings = SimpleNamespace(
+        semantic_row_ownership=SimpleNamespace(value_confidence=0.9),
+    )
+    candidate = {
+        "table": SimpleNamespace(id=11, business_name="Orders"),
+        "column": SimpleNamespace(id=101),
+        "confidence": 0.96,
+        "reason": "obvious department column",
+    }
+    profile = {
+        "total_rows": 5,
+        "null_rows": 1,
+        "empty_rows": 0,
+        "source_domain_fingerprint": "fingerprint",
+        "source_values": [{
+            "source_type": "string",
+            "source_value": "Sales",
+            "row_count": 4,
+        }],
+    }
+
+    result = await service._map_ownership_values(candidate, profile, [{
+        "org_unit_id": 7,
+        "name": "Sales",
+        "code": "SALES",
+        "full_path": "Company / Sales",
+    }])
+
+    assert result["proposed_mapping"]["org_value_kind"] == "external"
+    assert result["validation"]["blockers"] == []
+    assert result["proposed_mapping"]["org_value_mapping"]["bindings"][0]["org_unit_id"] == 7
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("confidence", "accepted"), [(0.92, False), (0.96, True)])
+async def test_expanded_row_ownership_requires_higher_ai_value_confidence(
+    confidence, accepted,
+):
+    service = _evidence_service()
+    service.settings = SimpleNamespace(
+        llm=SimpleNamespace(fast_model="test", model="test"),
+        semantic_row_ownership=SimpleNamespace(
+            value_confidence=0.90,
+            expanded_value_confidence=0.95,
+        ),
+    )
+
+    class FakeLLM:
+        async def generate_json(self, _messages, **_kwargs):
+            return {"mappings": [{
+                "source_type": "string",
+                "source_value": "North shop",
+                "target_kind": "org_unit",
+                "org_unit_id": 7,
+                "confidence": confidence,
+                "reason": "对应北区门店部门",
+            }]}
+
+    service.llm = FakeLLM()
+    result = await service._map_ownership_values(
+        {
+            "table": SimpleNamespace(id=11, business_name="Orders"),
+            "column": SimpleNamespace(id=101),
+            "confidence": 0.97,
+            "reason": "expanded organization unit",
+            "candidate_tier": "expanded",
+            "metadata_score": 6,
+            "matched_signals": ["expanded_unit:store", "identifier:id"],
+        },
+        {
+            "total_rows": 5,
+            "null_rows": 0,
+            "empty_rows": 0,
+            "source_domain_fingerprint": "fingerprint",
+            "source_values": [{
+                "source_type": "string",
+                "source_value": "North shop",
+                "row_count": 5,
+            }],
+        },
+        [{
+            "org_unit_id": 7,
+            "name": "Sales",
+            "code": "SALES",
+            "full_path": "Company / Sales",
+        }],
+    )
+
+    assert result["validation"]["value_confidence_threshold"] == 0.95
+    assert bool(result["proposed_mapping"]["org_value_mapping"]["bindings"]) is accepted
+    assert bool(result["validation"]["blockers"]) is (not accepted)
 
 
 def test_profile_content_requires_all_structured_sections():

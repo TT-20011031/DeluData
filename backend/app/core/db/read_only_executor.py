@@ -18,9 +18,11 @@ from dataclasses import dataclass
 from threading import Lock
 
 import sqlparse
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
+
+from app.core.db.mysql_connection_policy import create_mysql_engine
 
 logger = logging.getLogger(__name__)
 
@@ -106,12 +108,12 @@ class ReadOnlyExecutorPool:
                     logger.info(f"销毁用户 {user_id} 的旧连接池（URL已变更）")
                 
                 # 创建新连接池
-                engine = create_engine(
+                engine = create_mysql_engine(
                     connection_url,
                     pool_pre_ping=True,
                     pool_size=5,
                     pool_recycle=3600,
-                    connect_args={"connect_timeout": connect_timeout_sec}
+                    connect_args={"connect_timeout": connect_timeout_sec},
                 )
                 self._engines[cache_key] = _CachedEngine(engine, connection_url, connect_timeout_sec)
                 logger.info(f"为用户 {user_id} 创建新的只读连接池")

@@ -17,6 +17,7 @@ from app.models.auth.organization import DepartmentModel
 from app.models.config.semantic import (
     SemanticColumnModel,
     SemanticDatasourceModel,
+    SemanticMetricModel,
     SemanticOwnershipMappingModel,
     SemanticPolicyBindingModel,
     SemanticPolicyVersionEffectModel,
@@ -311,6 +312,13 @@ async def list_organization_targets(
         ))).scalars().all()
         existing = {(row.target_type, row.target_id): row for row in existing_rows}
         active_version_ids = [row.active_version_id for row in existing_rows if row.active_version_id]
+        active_versions = {
+            int(row.id): row for row in (await session.execute(select(
+                SemanticPolicyVersionModel,
+            ).where(
+                SemanticPolicyVersionModel.id.in_(active_version_ids or [-1]),
+            ))).scalars()
+        }
         denied_bindings: set[int] = set()
         if active_version_ids:
             denied_bindings = set((await session.execute(select(
@@ -322,6 +330,9 @@ async def list_organization_targets(
 
         async def payload(kind: str, item_id: str, label: str, **extra: Any) -> dict[str, Any]:
             binding = existing.get((kind, item_id))
+            direct_rules = (
+                active_versions.get(int(binding.active_version_id)).definition_json or {}
+            ).get("tables") or [] if binding and binding.active_version_id in active_versions else []
             probe = binding or SimpleNamespace(
                 workspace_id=workspace_id,
                 target_type=kind,
@@ -335,10 +346,9 @@ async def list_organization_targets(
                 **extra,
                 "binding_id": getattr(binding, "id", None),
                 "revision": getattr(binding, "revision", 0),
-                "configured": bool(binding and binding.status and binding.active_version_id),
-                "include_descendants": bool(getattr(
-                    binding, "include_descendants", extra.get("include_descendants", False),
-                )),
+                "configured": bool(binding and binding.status and direct_rules),
+                "direct_override_count": len(direct_rules),
+                "include_descendants": kind == "org_unit",
                 "affected_user_count": await _affected_user_count(session, probe),
                 "has_explicit_deny": bool(binding and binding.id in denied_bindings),
             }
@@ -469,6 +479,7 @@ async def ensure_binding(
         datasource = await session.get(SemanticDatasourceModel, datasource_id)
         if not datasource or datasource.workspace_id != workspace_id:
             raise SemanticBindingError("数据源不存在", code="datasource_not_found", status_code=404)
+        include_descendants = target_type == "org_unit"
         await _target_exists_v3(session, workspace_id, target_type, target_id)
         await _assert_actor_scope_v3(
             session, workspace_id, actor_id, "semantic_access:manage",
@@ -665,6 +676,104 @@ async def _custom_org_scope_ids(
     return sorted(expanded)
 
 
+def _mapping_value_payload(mapping: Any) -> dict[str, Any]:
+    value = getattr(mapping, "org_value_mapping_json", None)
+    if value is None:
+        value = getattr(mapping, "org_value_mapping", None)
+    return dict(value or {})
+
+
+def _typed_source_key(source_type: str, source_value: Any) -> tuple[str, str]:
+    return source_type, str(source_value)
+
+
+def _is_string_data_type(data_type: Any) -> bool:
+    value = str(data_type or "").lower()
+    return any(item in value for item in ("char", "text", "string", "enum", "set"))
+
+
+def _external_values_for_orgs(mapping: Any, org_ids: list[int]) -> list[Any]:
+    allowed = {int(value) for value in org_ids}
+    values: list[Any] = []
+    for binding in _mapping_value_payload(mapping).get("bindings") or []:
+        if (
+            isinstance(binding, dict)
+            and binding.get("target_kind") == "org_unit"
+            and int(binding.get("org_unit_id") or 0) in allowed
+        ):
+            values.append(binding.get("source_value"))
+    return values
+
+
+def _explicit_unowned_values(mapping: Any) -> list[Any]:
+    return [
+        binding.get("source_value")
+        for binding in (_mapping_value_payload(mapping).get("bindings") or [])
+        if isinstance(binding, dict) and binding.get("target_kind") == "unowned"
+    ]
+
+
+async def _organization_values(
+    session,
+    workspace_id: str,
+    mapping: Any,
+    org_ids: list[int],
+) -> list[Any]:
+    if mapping.org_value_kind == "code":
+        return list((await session.execute(select(DepartmentModel.code).where(
+            DepartmentModel.workspace_id == workspace_id,
+            DepartmentModel.id.in_(org_ids or [-1]),
+        ))).scalars().all())
+    if mapping.org_value_kind == "external":
+        return _external_values_for_orgs(mapping, org_ids)
+    return list(org_ids)
+
+
+async def _build_organization_condition(
+    session,
+    workspace_id: str,
+    mapping: Any,
+    org_ids: list[int],
+    marker: dict[str, Any],
+) -> dict[str, Any]:
+    column_id = int(mapping.org_column_id)
+    values = await _organization_values(
+        session, workspace_id, mapping, list(org_ids or []),
+    )
+    if marker.get("unowned_access") != "table_grantees":
+        return {
+            "_organization_scope": marker,
+            "column_id": column_id,
+            "operator": "in",
+            "value": values,
+        }
+
+    column = await session.get(SemanticColumnModel, column_id)
+    runtime_marker = {**marker, "column_id": column_id}
+    rules: list[dict[str, Any]] = []
+    if values:
+        rules.append({
+            "column_id": column_id,
+            "operator": "in",
+            "value": values,
+        })
+    rules.append({"column_id": column_id, "operator": "is null"})
+    if column and _is_string_data_type(column.data_type):
+        rules.append({"column_id": column_id, "operator": "=", "value": ""})
+    unowned_values = _explicit_unowned_values(mapping)
+    if unowned_values:
+        rules.append({
+            "column_id": column_id,
+            "operator": "in",
+            "value": unowned_values,
+        })
+    return {
+        "_organization_scope": runtime_marker,
+        "op": "OR",
+        "rules": rules,
+    }
+
+
 async def _prepare_definition_v3(
     session,
     binding,
@@ -703,6 +812,7 @@ async def _prepare_definition_v3(
             table_id=int(table_id),
             org_column_id=payload.get("org_column_id"),
             org_value_kind=payload.get("org_value_kind") or "id",
+            org_value_mapping_json=payload.get("org_value_mapping") or {},
             user_column_id=payload.get("user_column_id"),
             user_value_kind=payload.get("user_value_kind") or "id",
         )
@@ -725,6 +835,13 @@ async def _prepare_definition_v3(
             scope_type = "all" if binding.target_type == "baseline" else "target_org"
         if scope_type == "department":
             scope_type = "target_org_tree" if raw_scope.get("include_descendants", True) else "target_org"
+        unowned_access = raw_scope.get("unowned_access")
+        if unowned_access not in {None, "table_grantees"}:
+            blockers.append({
+                "code": "unowned_access_invalid",
+                "message": f"表 {table_id} 的无归属行访问策略无效",
+            })
+            continue
 
         policy_condition: dict[str, Any] | None = None
         org_scope_ids: list[int] | None = []
@@ -757,6 +874,8 @@ async def _prepare_definition_v3(
                 continue
             org_scope_ids = await _target_root_org_ids(session, binding, scope_type)
             marker = {"type": normalized_scope}
+            if unowned_access:
+                marker["unowned_access"] = unowned_access
         elif scope_type == "custom_org":
             org_scope_ids = await _custom_org_scope_ids(
                 session, binding.workspace_id, raw_scope,
@@ -795,18 +914,13 @@ async def _prepare_definition_v3(
                     "message": f"表 {table_id} 缺少组织归属字段映射",
                 })
             else:
-                values: list[Any] = list(org_scope_ids or [])
-                if mapping.org_value_kind == "code":
-                    values = list((await session.execute(select(DepartmentModel.code).where(
-                        DepartmentModel.workspace_id == binding.workspace_id,
-                        DepartmentModel.id.in_(org_scope_ids or [-1]),
-                    ))).scalars().all())
-                organization_condition = {
-                    "_organization_scope": marker,
-                    "column_id": mapping.org_column_id,
-                    "operator": "in",
-                    "value": values,
-                }
+                organization_condition = await _build_organization_condition(
+                    session,
+                    binding.workspace_id,
+                    mapping,
+                    list(org_scope_ids or []),
+                    marker,
+                )
 
         conditions = [item for item in (organization_condition, policy_condition) if item]
         if not conditions:
@@ -848,6 +962,7 @@ async def persist_target_policy_version_in_session(
         binding.datasource_id,
         prepared,
         schema_fingerprint=getattr(datasource, "schema_fingerprint", None),
+        allow_empty_tables=True,
     )
     blockers = ownership_blockers + list(compilation["validation"].get("blockers") or [])
     warnings = list(compilation["validation"].get("warnings") or [])
@@ -927,6 +1042,69 @@ async def upsert_ownership_mapping_in_session(
         ))).scalars().all())
         if valid_ids != set(column_ids):
             raise SemanticBindingError("归属字段不属于当前语义表", code="ownership_column_invalid")
+    org_value_kind = payload.get("org_value_kind") or "id"
+    if org_value_kind not in {"id", "code", "external"}:
+        raise SemanticBindingError("组织归属值类型无效", code="ownership_value_kind_invalid")
+    org_value_mapping = dict(payload.get("org_value_mapping") or {})
+    bindings = org_value_mapping.get("bindings") or []
+    if not isinstance(bindings, list):
+        raise SemanticBindingError("外部组织值映射格式无效", code="ownership_value_mapping_invalid")
+    seen_source_values: set[tuple[str, str]] = set()
+    requested_org_ids: set[int] = set()
+    normalized_bindings: list[dict[str, Any]] = []
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            raise SemanticBindingError("外部组织值映射格式无效", code="ownership_value_mapping_invalid")
+        source_type = str(binding.get("source_type") or "")
+        source_value = binding.get("source_value")
+        if (
+            source_type not in {"string", "integer"}
+            or isinstance(source_value, (dict, list, bool))
+            or source_type == "string" and not isinstance(source_value, str)
+            or source_type == "integer" and not isinstance(source_value, int)
+        ):
+            raise SemanticBindingError("外部组织源值格式无效", code="ownership_source_value_invalid")
+        key = _typed_source_key(source_type, source_value)
+        if key in seen_source_values:
+            raise SemanticBindingError("外部组织源值重复", code="ownership_source_value_duplicated")
+        seen_source_values.add(key)
+        target_kind = binding.get("target_kind")
+        normalized = dict(binding)
+        if target_kind == "org_unit":
+            org_unit_id = int(binding.get("org_unit_id") or 0)
+            if not org_unit_id:
+                raise SemanticBindingError("外部组织值缺少目标部门", code="ownership_target_required")
+            requested_org_ids.add(org_unit_id)
+            normalized["org_unit_id"] = org_unit_id
+        elif target_kind == "unowned":
+            if not binding.get("manual_unowned") or not str(binding.get("reason") or "").strip():
+                raise SemanticBindingError(
+                    "非空值标记为无归属需要管理员明确确认并填写原因",
+                    code="ownership_unowned_confirmation_required",
+                )
+            normalized.pop("org_unit_id", None)
+        else:
+            raise SemanticBindingError("外部组织值目标无效", code="ownership_target_invalid")
+        normalized_bindings.append(normalized)
+    if requested_org_ids:
+        valid_org_ids = set((await session.execute(select(DepartmentModel.id).where(
+            DepartmentModel.workspace_id == workspace_id,
+            DepartmentModel.status == True,  # noqa: E712
+            DepartmentModel.id.in_(requested_org_ids),
+        ))).scalars().all())
+        if valid_org_ids != requested_org_ids:
+            raise SemanticBindingError("外部组织值包含无效目标部门", code="ownership_target_invalid")
+    if org_value_mapping:
+        org_value_mapping = {
+            **org_value_mapping,
+            "version": 1,
+            "bindings": normalized_bindings,
+        }
+    if org_value_kind == "external" and not normalized_bindings:
+        raise SemanticBindingError(
+            "外部组织值映射不能为空", code="ownership_value_mapping_required",
+        )
+
     row = (await session.execute(select(SemanticOwnershipMappingModel).where(
         SemanticOwnershipMappingModel.workspace_id == workspace_id,
         SemanticOwnershipMappingModel.datasource_id == datasource_id,
@@ -944,18 +1122,22 @@ async def upsert_ownership_mapping_in_session(
         before = {
             "org_column_id": row.org_column_id,
             "org_value_kind": row.org_value_kind,
+            "org_value_mapping": row.org_value_mapping_json or {},
             "user_column_id": row.user_column_id,
             "user_value_kind": row.user_value_kind,
         }
     for key in ("org_column_id", "org_value_kind", "user_column_id", "user_value_kind"):
         if key in payload:
             setattr(row, key, payload[key])
+    if "org_value_mapping" in payload:
+        row.org_value_mapping_json = org_value_mapping
     row.updated_by = actor_id
     await session.flush()
     after = {
         "table_id": table_id,
         "org_column_id": row.org_column_id,
         "org_value_kind": row.org_value_kind,
+        "org_value_mapping": row.org_value_mapping_json or {},
         "user_column_id": row.user_column_id,
         "user_value_kind": row.user_value_kind,
     }
@@ -1252,9 +1434,7 @@ async def get_target_policy(
             SemanticPolicyBindingModel.target_type == target_type,
             SemanticPolicyBindingModel.target_id == target_id,
         ))).scalar_one_or_none()
-        include_descendants = bool(
-            getattr(binding, "include_descendants", target_type == "org_unit")
-        )
+        include_descendants = target_type == "org_unit"
         await _assert_actor_scope_v3(
             session,
             workspace_id,
@@ -1264,6 +1444,14 @@ async def get_target_policy(
             target_id,
             include_descendants,
         )
+        policy_context = await _effective_policy_context(
+            session,
+            workspace_id,
+            datasource_id,
+            target_type=target_type,
+            target_id=target_id,
+        )
+        effective_tables = list(policy_context["effective"].values())
         if binding is None:
             return {
                 "id": None,
@@ -1272,7 +1460,7 @@ async def get_target_policy(
                 "datasource_id": datasource_id,
                 "target_type": target_type,
                 "target_id": target_id,
-                "include_descendants": include_descendants,
+                "include_descendants": target_type == "org_unit",
                 "active_version_id": None,
                 "active_version": None,
                 "revision": 0,
@@ -1283,6 +1471,7 @@ async def get_target_policy(
                     target_id=target_id,
                     include_descendants=include_descendants,
                 )),
+                "effective_tables": effective_tables,
             }
         payload = _binding_payload(binding)
         if binding.active_version_id:
@@ -1292,6 +1481,8 @@ async def get_target_policy(
             payload["active_version"] = None
         payload["binding_id"] = binding.id
         payload["affected_user_count"] = await _affected_user_count(session, binding)
+        payload["include_descendants"] = target_type == "org_unit"
+        payload["effective_tables"] = effective_tables
         return payload
 
 
@@ -1316,7 +1507,7 @@ async def save_target_policy(
         if not datasource or datasource.workspace_id != workspace_id:
             raise SemanticBindingError("数据源不存在", code="datasource_not_found", status_code=404)
         await _target_exists_v3(session, workspace_id, target_type, target_id)
-        requested_descendants = bool(include_descendants and target_type == "org_unit")
+        requested_descendants = target_type == "org_unit"
         await _assert_actor_scope_v3(
             session,
             workspace_id,
@@ -1439,6 +1630,7 @@ async def get_ownership_mappings(workspace_id: str, datasource_id: int) -> list[
             "table_id": row.table_id,
             "org_column_id": row.org_column_id,
             "org_value_kind": row.org_value_kind,
+            "org_value_mapping": row.org_value_mapping_json or {},
             "user_column_id": row.user_column_id,
             "user_value_kind": row.user_value_kind,
         } for row in rows]
@@ -1496,6 +1688,9 @@ async def _refresh_runtime_authorization_condition(
     ))).scalar_one_or_none()
     if not mapping or not mapping.org_column_id:
         # A missing mapping after activation must fail closed.
+        if marker.get("unowned_access") == "table_grantees":
+            column_id = int(marker.get("column_id") or 0)
+            return {"column_id": column_id, "operator": "in", "value": []}
         return _replace_authorization_condition(condition, column_id=-1, values=[])
     scope_type = marker.get("type") or "target_org"
     if scope_type == "custom_org":
@@ -1508,12 +1703,17 @@ async def _refresh_runtime_authorization_condition(
         org_ids = await _target_root_org_ids(session, binding, scope_type)
     else:
         org_ids = await _binding_org_scope(session, binding)
-    values: list[Any] = list(org_ids or [])
-    if mapping.org_value_kind == "code":
-        values = list((await session.execute(select(DepartmentModel.code).where(
-            DepartmentModel.workspace_id == binding.workspace_id,
-            DepartmentModel.id.in_(org_ids or [-1]),
-        ))).scalars().all())
+    if marker.get("unowned_access") == "table_grantees":
+        return await _build_organization_condition(
+            session,
+            binding.workspace_id,
+            mapping,
+            list(org_ids or []),
+            {key: value for key, value in marker.items() if key != "column_id"},
+        )
+    values = await _organization_values(
+        session, binding.workspace_id, mapping, list(org_ids or []),
+    )
     return _replace_authorization_condition(
         condition, column_id=int(mapping.org_column_id), values=values,
     )
@@ -1535,12 +1735,283 @@ def _binding_matches_assignments(
         return int(binding.target_id) in assignment_position_ids
     if binding.target_type == "org_unit":
         target_org_id = int(binding.target_id)
-        return target_org_id in (
-            ancestor_org_ids
-            if bool(getattr(binding, "include_descendants", False))
-            else assignment_org_ids
-        )
+        return target_org_id in ancestor_org_ids
     return False
+
+
+def _ancestor_chain(org_id: int, parent_by_org: dict[int, int | None]) -> list[int]:
+    """Return an organization chain from the selected unit to the root."""
+    chain = [int(org_id)]
+    seen = {int(org_id)}
+    current = parent_by_org.get(int(org_id))
+    while current is not None and int(current) not in seen:
+        current_id = int(current)
+        chain.append(current_id)
+        seen.add(current_id)
+        current = parent_by_org.get(current_id)
+    return chain
+
+
+def _rules_by_binding(
+    bindings: list[SemanticPolicyBindingModel],
+    versions: dict[int, SemanticPolicyVersionModel],
+) -> dict[int, dict[int, dict[str, Any]]]:
+    result: dict[int, dict[int, dict[str, Any]]] = {}
+    for binding in bindings:
+        version = versions.get(int(binding.active_version_id or 0))
+        result[int(binding.id)] = {
+            int(rule["table_id"]): dict(rule)
+            for rule in (version.definition_json if version else {}).get("tables") or []
+            if isinstance(rule, dict) and rule.get("table_id")
+        }
+    return result
+
+
+def _winning_bindings_for_table(
+    table_id: int,
+    *,
+    baseline_bindings: list[SemanticPolicyBindingModel],
+    user_binding: SemanticPolicyBindingModel | None,
+    position_bindings: dict[int, SemanticPolicyBindingModel],
+    org_bindings: dict[int, SemanticPolicyBindingModel],
+    assignment_position_ids: set[int],
+    assignment_org_ids: set[int],
+    parent_by_org: dict[int, int | None],
+    rules: dict[int, dict[int, dict[str, Any]]],
+) -> list[SemanticPolicyBindingModel]:
+    """Choose the most-specific bindings that explicitly configure one table."""
+    if user_binding and table_id in rules.get(int(user_binding.id), {}):
+        return [user_binding]
+
+    matched_positions = [
+        binding
+        for position_id, binding in position_bindings.items()
+        if position_id in assignment_position_ids
+        and table_id in rules.get(int(binding.id), {})
+    ]
+    if matched_positions:
+        return matched_positions
+
+    matched_departments: dict[int, SemanticPolicyBindingModel] = {}
+    for org_id in assignment_org_ids:
+        for candidate_id in _ancestor_chain(org_id, parent_by_org):
+            binding = org_bindings.get(candidate_id)
+            if binding and table_id in rules.get(int(binding.id), {}):
+                matched_departments[int(binding.id)] = binding
+                break
+    if matched_departments:
+        return list(matched_departments.values())
+
+    return [
+        binding for binding in baseline_bindings
+        if table_id in rules.get(int(binding.id), {})
+    ]
+
+
+def _merge_winning_rules(
+    table_id: int,
+    bindings: list[SemanticPolicyBindingModel],
+    rules: dict[int, dict[int, dict[str, Any]]],
+) -> dict[str, Any] | None:
+    matched = [rules[int(binding.id)][table_id] for binding in bindings]
+    if not matched:
+        return None
+    hidden_columns = sorted({
+        int(item) for rule in matched for item in rule.get("hidden_column_ids") or []
+    })
+    hidden_metrics = sorted({
+        int(item) for rule in matched for item in rule.get("hidden_metric_ids") or []
+    })
+    if any(rule.get("decision") == "hidden" for rule in matched):
+        return {
+            "table_id": table_id,
+            "decision": "hidden",
+            "hidden_column_ids": hidden_columns,
+            "hidden_metric_ids": hidden_metrics,
+        }
+    merged = {
+        "table_id": table_id,
+        "decision": "visible",
+        "hidden_column_ids": hidden_columns,
+        "hidden_metric_ids": hidden_metrics,
+    }
+    row_scopes = [rule.get("row_scope") for rule in matched if rule.get("row_scope")]
+    if row_scopes:
+        merged["row_scope"] = deepcopy(row_scopes[0])
+        if len(row_scopes) > 1:
+            merged["row_scopes"] = deepcopy(row_scopes)
+    return merged
+
+
+async def _effective_policy_context(
+    session,
+    workspace_id: str,
+    datasource_id: int,
+    *,
+    target_type: str,
+    target_id: str,
+    definition_overrides: dict[tuple[str, str], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Load sparse policies and resolve their effective per-table precedence.
+
+    ``definition_overrides`` is used only by review-time configuration previews.
+    Runtime callers omit it and therefore continue to use activated versions only.
+    """
+    bindings = list((await session.execute(select(SemanticPolicyBindingModel).where(
+        SemanticPolicyBindingModel.workspace_id == workspace_id,
+        SemanticPolicyBindingModel.datasource_id == datasource_id,
+        SemanticPolicyBindingModel.status == True,  # noqa: E712
+        SemanticPolicyBindingModel.active_version_id.is_not(None),
+        SemanticPolicyBindingModel.target_type.in_(TARGET_TYPES),
+    ))).scalars())
+    version_ids = [int(row.active_version_id) for row in bindings if row.active_version_id]
+    versions = {
+        int(row.id): row for row in (await session.execute(select(
+            SemanticPolicyVersionModel,
+        ).where(SemanticPolicyVersionModel.id.in_(version_ids or [-1])))).scalars()
+    }
+    rules = _rules_by_binding(bindings, versions)
+    if definition_overrides:
+        binding_by_target = {
+            (row.target_type, row.target_id): row for row in bindings
+        }
+        next_preview_id = -1
+        for (override_type, override_id), definition in definition_overrides.items():
+            binding = binding_by_target.get((override_type, override_id))
+            if binding is None:
+                binding = SimpleNamespace(
+                    id=next_preview_id,
+                    workspace_id=workspace_id,
+                    datasource_id=datasource_id,
+                    target_type=override_type,
+                    target_id=override_id,
+                    include_descendants=override_type == "org_unit",
+                    active_version_id=None,
+                    status=True,
+                )
+                next_preview_id -= 1
+                bindings.append(binding)
+                binding_by_target[(override_type, override_id)] = binding
+            rules[int(binding.id)] = {
+                int(rule["table_id"]): dict(rule)
+                for rule in (definition or {}).get("tables") or []
+                if isinstance(rule, dict) and rule.get("table_id")
+            }
+    baseline_bindings = [row for row in bindings if row.target_type == "baseline"]
+    user_bindings = {row.target_id: row for row in bindings if row.target_type == "user"}
+    position_bindings = {
+        int(row.target_id): row for row in bindings if row.target_type == "position"
+    }
+    org_bindings = {
+        int(row.target_id): row for row in bindings if row.target_type == "org_unit"
+    }
+    org_labels = dict((await session.execute(select(
+        DepartmentModel.id, DepartmentModel.name,
+    ).where(DepartmentModel.workspace_id == workspace_id))).all())
+    position_labels = dict((await session.execute(select(
+        PositionModel.id, PositionModel.name,
+    ).where(PositionModel.workspace_id == workspace_id))).all())
+    user_labels = dict((await session.execute(select(
+        UserModel.id, UserModel.username,
+    ).where(UserModel.workspace_id == workspace_id))).all())
+
+    def source_label(binding: SemanticPolicyBindingModel) -> str:
+        if binding.target_type == "baseline":
+            return "全员基线"
+        if binding.target_type == "org_unit":
+            return str(org_labels.get(int(binding.target_id), binding.target_id))
+        if binding.target_type == "position":
+            return str(position_labels.get(int(binding.target_id), binding.target_id))
+        return str(user_labels.get(binding.target_id, binding.target_id))
+    parent_by_org = dict((await session.execute(select(
+        DepartmentModel.id, DepartmentModel.parent_id,
+    ).where(DepartmentModel.workspace_id == workspace_id))).all())
+
+    assignment_position_ids: set[int] = set()
+    assignment_org_ids: set[int] = set()
+    user_binding = None
+    if target_type == "org_unit":
+        assignment_org_ids = {int(target_id)}
+    elif target_type == "position":
+        position = await session.get(PositionModel, int(target_id))
+        if position:
+            assignment_position_ids = {int(position.id)}
+            assignment_org_ids = {int(position.org_unit_id)}
+    elif target_type == "user":
+        context = await build_effective_access_context(session, workspace_id, target_id)
+        assignment_position_ids = {int(item.position_id) for item in context.assignments}
+        assignment_org_ids = {int(item.org_unit_id) for item in context.assignments}
+        user_binding = user_bindings.get(target_id)
+
+    tables = list((await session.execute(select(SemanticTableModel).where(
+        SemanticTableModel.workspace_id == workspace_id,
+        SemanticTableModel.datasource_id == datasource_id,
+        SemanticTableModel.status == "confirmed",
+        SemanticTableModel.sync_state == "current",
+        SemanticTableModel.is_queryable == True,  # noqa: E712
+    ).order_by(SemanticTableModel.id))).scalars())
+    direct_binding = next((
+        row for row in bindings
+        if row.target_type == target_type and row.target_id == target_id
+    ), None)
+    effective: dict[int, dict[str, Any]] = {}
+    winners: dict[int, list[SemanticPolicyBindingModel]] = {}
+    for table in tables:
+        table_id = int(table.id)
+        if target_type == "baseline":
+            selected = [
+                row for row in baseline_bindings
+                if table_id in rules.get(int(row.id), {})
+            ]
+        else:
+            selected = _winning_bindings_for_table(
+                table_id,
+                baseline_bindings=baseline_bindings,
+                user_binding=user_binding,
+                position_bindings=position_bindings,
+                org_bindings=org_bindings,
+                assignment_position_ids=assignment_position_ids,
+                assignment_org_ids=assignment_org_ids,
+                parent_by_org=parent_by_org,
+                rules=rules,
+            )
+        winners[table_id] = selected
+        merged = _merge_winning_rules(table_id, selected, rules) or {
+            "table_id": table_id,
+            "decision": "hidden",
+            "hidden_column_ids": [],
+            "hidden_metric_ids": [],
+        }
+        source_type = selected[0].target_type if selected else "default_deny"
+        direct = bool(
+            direct_binding
+            and table_id in rules.get(int(direct_binding.id), {})
+        )
+        sources = [{
+            "binding_id": int(row.id),
+            "target_type": row.target_type,
+            "target_id": row.target_id,
+            "label": source_label(row),
+        } for row in selected]
+        seed = {key: deepcopy(value) for key, value in merged.items() if key != "row_scopes"}
+        if target_type == "user" and len(merged.get("row_scopes") or []) > 1:
+            seed["row_scope"] = {"type": "all_assignments"}
+        effective[table_id] = {
+            **merged,
+            "is_direct_override": direct,
+            "source": "direct" if direct else source_type,
+            "sources": sources,
+            "override_seed": seed,
+        }
+    return {
+        "bindings": bindings,
+        "rules": rules,
+        "versions": versions,
+        "tables": tables,
+        "direct_binding": direct_binding,
+        "effective": effective,
+        "winners": winners,
+    }
 
 
 def _definition_expands_access(
@@ -1605,46 +2076,54 @@ async def load_bound_semantic_runtime(
         ):
             # Fail closed for ordinary accounts until an evidence set is compiled and published.
             return None
-        candidates = (await session.execute(select(SemanticPolicyBindingModel).where(
-            SemanticPolicyBindingModel.workspace_id == workspace_id,
-            SemanticPolicyBindingModel.datasource_id == datasource_id,
-            SemanticPolicyBindingModel.status == True,  # noqa: E712
-            SemanticPolicyBindingModel.active_version_id.is_not(None),
-            SemanticPolicyBindingModel.target_type.in_(TARGET_TYPES),
-        ))).scalars().all()
-        assignment_org_ids = {int(item.org_unit_id) for item in context.assignments}
-        assignment_position_ids = {int(item.position_id) for item in context.assignments}
-        parent_by_org = dict((await session.execute(select(
-            DepartmentModel.id, DepartmentModel.parent_id,
-        ).where(DepartmentModel.workspace_id == workspace_id))).all())
-        ancestor_org_ids = set(assignment_org_ids)
-        for org_id in list(assignment_org_ids):
-            current = parent_by_org.get(org_id)
-            visited: set[int] = set()
-            while current is not None and current not in visited:
-                visited.add(int(current))
-                ancestor_org_ids.add(int(current))
-                current = parent_by_org.get(current)
-
-        bindings: list[SemanticPolicyBindingModel] = []
-        for binding in candidates:
-            if _binding_matches_assignments(
-                binding,
-                user_id,
-                assignment_org_ids,
-                assignment_position_ids,
-                ancestor_org_ids,
-            ):
-                bindings.append(binding)
-        if not bindings:
+        policy_context = await _effective_policy_context(
+            session,
+            workspace_id,
+            datasource_id,
+            target_type="user",
+            target_id=user_id,
+        )
+        winner_ids_by_table = {
+            int(table_id): {int(binding.id) for binding in bindings}
+            for table_id, bindings in policy_context["winners"].items()
+            if bindings
+        }
+        binding_ids = sorted({
+            binding_id for values in winner_ids_by_table.values() for binding_id in values
+        })
+        if not binding_ids:
             return None
-        version_ids = [row.active_version_id for row in bindings]
-        binding_by_id = {row.id: row for row in bindings}
+        binding_by_id = {
+            int(row.id): row for row in policy_context["bindings"]
+            if int(row.id) in binding_ids
+        }
+        version_ids = [row.active_version_id for row in binding_by_id.values()]
         effects = (await session.execute(select(SemanticPolicyVersionEffectModel).where(
             SemanticPolicyVersionEffectModel.version_id.in_(version_ids)
         ).order_by(SemanticPolicyVersionEffectModel.priority.desc()))).scalars().all()
+        column_tables = dict((await session.execute(select(
+            SemanticColumnModel.id, SemanticColumnModel.table_id,
+        ).where(
+            SemanticColumnModel.workspace_id == workspace_id,
+            SemanticColumnModel.datasource_id == datasource_id,
+        ))).all())
+        metric_tables = dict((await session.execute(select(
+            SemanticMetricModel.id, SemanticMetricModel.table_id,
+        ).where(
+            SemanticMetricModel.workspace_id == workspace_id,
+            SemanticMetricModel.datasource_id == datasource_id,
+        ))).all())
         effects_by_asset: dict[str, list[dict[str, Any]]] = {}
         for row in effects:
+            table_id = (
+                int(row.asset_id)
+                if row.asset_type == "table"
+                else int((column_tables if row.asset_type == "column" else metric_tables).get(
+                    int(row.asset_id), 0,
+                ))
+            )
+            if int(row.binding_id) not in winner_ids_by_table.get(table_id, set()):
+                continue
             key = f"{row.asset_type}:{row.asset_id}"
             condition = deepcopy(row.condition_json or {})
             if row.effect_type == "row_filter" and row.binding_id in binding_by_id:
@@ -1663,7 +2142,7 @@ async def load_bound_semantic_runtime(
         return {
             "is_admin": False,
             "effects_by_asset": effects_by_asset,
-            "policy_ids": version_ids,
+            "policy_ids": sorted({int(item) for item in version_ids if item}),
             "authorization_revision": context.revision,
             "authorization_valid_until": context.valid_until.isoformat() if context.valid_until else None,
         }

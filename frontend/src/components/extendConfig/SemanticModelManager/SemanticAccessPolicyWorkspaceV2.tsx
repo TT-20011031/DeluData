@@ -21,7 +21,6 @@ import {
   Loader2,
   Menu,
   RefreshCw,
-  Save,
   Search,
   Settings2,
   ShieldCheck,
@@ -33,6 +32,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Dialog,
   DialogContent,
@@ -75,7 +75,10 @@ import {
   type SemanticAccessTargetPage,
   type SemanticAccessTargetSummary,
   type SemanticAccessTargetType,
+  type SemanticEffectiveTableRule,
   type SemanticAccessVersion,
+  type SemanticAccessSimilarSuggestionApplyResult,
+  type SemanticAccessSimilarSuggestionPreview,
   type SemanticOwnershipMapping,
 } from '@/features/semanticAccess/types'
 import type {
@@ -87,10 +90,14 @@ import type {
   SemanticTable,
 } from '@/types/extendConfig'
 import {
+  bootstrapEffectiveRules,
   hasSemanticAccessPermissionChanges,
+  persistedSemanticAccessTableRule,
+  semanticAccessDecisionOriginLabel,
 } from './semanticAccessPolicyDraftUtils'
 import {
   accessLevelLabel,
+  authorizationNeedsReview,
   evidenceAccessLevel,
   evidenceBaselineAccess,
   evidenceFieldDecision,
@@ -100,6 +107,7 @@ import {
   isLowEvidenceConfidence,
   isManuallyApproved,
   summarizeEvidenceConfirmations,
+  shouldPollEvidenceSet,
   type EvidenceConfirmationSummary,
   type EvidenceAccessLevel,
   type EvidenceFieldDecision,
@@ -108,6 +116,16 @@ import {
 type TargetTab = 'org_unit' | 'position' | 'user'
 type Area = 'baseline' | 'organization' | 'unassigned'
 type Mapping = SemanticOwnershipMapping
+
+type SimilarSuggestionContext = {
+  datasource_id: number
+  org_unit_id: number
+  source_table_id: number
+  source_before_rule: SemanticAccessTableRule | null
+  expected_binding_revision: number
+  bootstrap_run_id: number | null
+  expected_bootstrap_revision: number | null
+}
 
 type Suggestion = {
   draft_patch?: { tables?: SemanticAccessTableRule[] }
@@ -211,6 +229,17 @@ type EvidenceGenerationRun = {
 type BootstrapTargetResponse = {
   run: SemanticAccessBootstrapRun
   target: SemanticAccessBootstrapTarget
+  active_definition?: { name?: string; tables: SemanticAccessTableRule[] }
+  effective_tables?: SemanticEffectiveTableRule[]
+}
+
+type BootstrapTablePublishResponse = BootstrapTargetResponse & {
+  active_definition: { name?: string; tables: SemanticAccessTableRule[] }
+  binding_id: number
+  binding_revision: number
+  version_id: number
+  version: number
+  audit_id?: number
 }
 
 type AccessMatrixCell = {
@@ -238,6 +267,11 @@ type AccessMatrixPayload = {
     path: string
   }>
   cells: AccessMatrixCell[]
+}
+
+type InheritedEvidenceReview = {
+  confirmation: EvidenceConfirmationSummary
+  sourceLabel: string
 }
 
 type Props = {
@@ -294,8 +328,7 @@ export function SemanticAccessPolicyWorkspaceV2({
   const [mappings, setMappings] = useState<Record<number, Mapping>>({})
   const [rules, setRules] = useState<SemanticAccessTableRule[]>([])
   const [activeRules, setActiveRules] = useState<SemanticAccessTableRule[]>([])
-  const [includeDescendants, setIncludeDescendants] = useState(true)
-  const [activeIncludeDescendants, setActiveIncludeDescendants] = useState(true)
+  const [effectiveRules, setEffectiveRules] = useState<SemanticEffectiveTableRule[]>([])
   const enabledTables = useMemo(
     () => tables.filter(item => (
       item.status === 'confirmed'
@@ -333,13 +366,17 @@ export function SemanticAccessPolicyWorkspaceV2({
   const [toolDrawerOpen, setToolDrawerOpen] = useState(false)
   const [mobileTreeOpen, setMobileTreeOpen] = useState(false)
   const [unsavedOpen, setUnsavedOpen] = useState(false)
+  const [similarSuggestion, setSimilarSuggestion] = useState<SemanticAccessSimilarSuggestionPreview | null>(null)
+  const [similarSuggestionContext, setSimilarSuggestionContext] = useState<SimilarSuggestionContext | null>(null)
+  const [selectedSimilarSuggestionIds, setSelectedSimilarSuggestionIds] = useState<string[]>([])
+  const [similarSuggestionLoading, setSimilarSuggestionLoading] = useState(false)
+  const suggestionRequestToken = useRef(0)
   const [evidence, setEvidence] = useState<EvidencePayload>({ set: null })
   const [evidenceReadiness, setEvidenceReadiness] = useState<EvidenceReadiness | null>(null)
   const [bootstrapRun, setBootstrapRun] = useState<SemanticAccessBootstrapRun | null>(null)
   const [bootstrapSuggestions, setBootstrapSuggestions] = useState<SemanticAccessBootstrapSuggestions | null>(null)
   const [draftTarget, setDraftTarget] = useState<SemanticAccessBootstrapTarget | null>(null)
   const [evidenceFilter, setEvidenceFilter] = useState<'all' | 'pending' | 'restricted' | 'sensitive' | 'mapping'>('all')
-  const [publishDialogOpen, setPublishDialogOpen] = useState(false)
   const [departmentConfirmOpen, setDepartmentConfirmOpen] = useState(false)
   const [generationRun, setGenerationRun] = useState<EvidenceGenerationRun | null>(null)
   const [matrixOpen, setMatrixOpen] = useState(false)
@@ -364,6 +401,7 @@ export function SemanticAccessPolicyWorkspaceV2({
   )
   const currentTable = enabledTables.find(item => item.id === selectedTableId) || enabledTables[0]
   const currentRule = rules.find(item => item.table_id === currentTable?.id)
+  const currentEffectiveRule = effectiveRules.find(item => item.table_id === currentTable?.id)
   const tableColumns = enabledColumns.filter(item => item.table_id === currentTable?.id)
   const tableMetrics = enabledMetrics.filter(item => item.table_id === currentTable?.id)
   const currentMapping = currentTable
@@ -391,20 +429,24 @@ export function SemanticAccessPolicyWorkspaceV2({
       })
   }, [enabledColumns, enabledMetrics, enabledTableIds, rules])
   const isDirty = useMemo(
-    () => hasSemanticAccessPermissionChanges(rules, activeRules)
-      || (selectedTarget?.target_type === 'org_unit'
-        && includeDescendants !== activeIncludeDescendants),
-    [activeIncludeDescendants, activeRules, includeDescendants, rules, selectedTarget?.target_type],
+    () => hasSemanticAccessPermissionChanges(rules, activeRules),
+    [activeRules, rules],
   )
+  const currentTableDirty = useMemo(() => {
+    if (!currentTable) return false
+    return hasSemanticAccessPermissionChanges(
+      rules.filter(item => item.table_id === currentTable.id),
+      activeRules.filter(item => item.table_id === currentTable.id),
+    )
+  }, [
+    activeRules,
+    currentTable,
+    rules,
+  ])
   const initialReviewMode = Boolean(
-    evidenceReadiness?.access_bootstrap_required
-    && bootstrapRun?.status === 'review_ready',
-  )
-  const bootstrapBlockers = useMemo(
-    () => (bootstrapSuggestions?.targets || []).flatMap(target => (
-      target.validation?.blockers || []
-    )),
-    [bootstrapSuggestions],
+    bootstrapRun?.status === 'review_ready'
+    && evidence.set
+    && ['review_ready', 'publish_failed'].includes(evidence.set.status),
   )
   const bootstrapDraftOrgIds = useMemo(
     () => new Set((bootstrapSuggestions?.targets || [])
@@ -426,23 +468,64 @@ export function SemanticAccessPolicyWorkspaceV2({
     }
     return null
   }, [area, evidence.set, initialReviewMode, selectedOrg, selectedTarget])
-  const evidenceConfirmation = useMemo(() => (
-    evidenceConfirmationTarget
-      ? summarizeEvidenceConfirmations(
-          evidence.assets || [],
-          evidence.relations || [],
-          evidenceConfirmationTarget.type,
-          evidenceConfirmationTarget.id,
-          new Set(enabledColumns.filter(column => column.is_sensitive).map(column => column.id)),
-          currentTable?.id,
-        )
-      : null
-  ), [
-    currentTable?.id,
+  const evidenceConfirmationsByTable = useMemo(() => {
+    if (!evidenceConfirmationTarget) return new Map<number, EvidenceConfirmationSummary>()
+    const sensitiveColumnIds = new Set(
+      enabledColumns.filter(column => column.is_sensitive).map(column => column.id),
+    )
+    return new Map(enabledTables.map(table => [
+      table.id,
+      summarizeEvidenceConfirmations(
+        evidence.assets || [],
+        evidence.relations || [],
+        evidenceConfirmationTarget.type,
+        evidenceConfirmationTarget.id,
+        sensitiveColumnIds,
+        table.id,
+      ),
+    ]))
+  }, [
     enabledColumns,
+    enabledTables,
     evidence.assets,
     evidence.relations,
     evidenceConfirmationTarget,
+  ])
+  const evidenceConfirmation = currentTable
+    ? evidenceConfirmationsByTable.get(currentTable.id) || null
+    : null
+  const inheritedEvidenceReviewsByTable = useMemo(() => {
+    const result = new Map<number, InheritedEvidenceReview>()
+    if (!initialReviewMode || !evidence.set) return result
+    const sensitiveColumnIds = new Set(
+      enabledColumns.filter(column => column.is_sensitive).map(column => column.id),
+    )
+    for (const effectiveRule of effectiveRules) {
+      if (effectiveRule.is_direct_override) continue
+      const source = effectiveRule.sources.find(item => (
+        item.target_type === 'org_unit' || item.target_type === 'baseline'
+      ))
+      if (!source) continue
+      result.set(effectiveRule.table_id, {
+        confirmation: summarizeEvidenceConfirmations(
+          evidence.assets || [],
+          evidence.relations || [],
+          source.target_type as 'baseline' | 'org_unit',
+          source.target_id,
+          sensitiveColumnIds,
+          effectiveRule.table_id,
+        ),
+        sourceLabel: source.label,
+      })
+    }
+    return result
+  }, [
+    effectiveRules,
+    enabledColumns,
+    evidence.assets,
+    evidence.relations,
+    evidence.set,
+    initialReviewMode,
   ])
   const evidenceTableAssets = useMemo(
     () => (evidence.assets || []).filter(asset => (
@@ -482,19 +565,16 @@ export function SemanticAccessPolicyWorkspaceV2({
   }, [apiPath, datasourceId])
 
   const loadEvidence = useCallback(async () => {
-    const [readiness, current] = await Promise.all([
-      semanticAccessRequest<EvidenceReadiness>(
-        apiPath(`/access-evidence/readiness?datasource_id=${datasourceId}`),
-      ),
-      semanticAccessRequest<EvidencePayload>(
-        apiPath(`/access-evidence/sets/current?datasource_id=${datasourceId}`),
-      ),
-    ])
+    const current = await semanticAccessRequest<EvidencePayload>(
+      apiPath(`/access-evidence/sets/current?datasource_id=${datasourceId}`),
+    )
+    const readiness = current.readiness || await semanticAccessRequest<EvidenceReadiness>(
+      apiPath(`/access-evidence/readiness?datasource_id=${datasourceId}`),
+    )
     setEvidenceReadiness(readiness)
     setEvidence(current)
     if (
       canManage
-      && readiness.access_bootstrap_required
       && current.set
       && ['review_ready', 'publish_failed'].includes(current.set.status)
     ) {
@@ -507,7 +587,7 @@ export function SemanticAccessPolicyWorkspaceV2({
         apiPath(`/access-bootstrap/runs/${run.run_id}/suggestions`),
       )
       setBootstrapSuggestions(nextSuggestions)
-    } else if (!readiness.access_bootstrap_required) {
+    } else if (!current.set || !['review_ready', 'publish_failed'].includes(current.set.status)) {
       setBootstrapRun(null)
       setBootstrapSuggestions(null)
       setDraftTarget(null)
@@ -575,7 +655,7 @@ export function SemanticAccessPolicyWorkspaceV2({
   }, [enabledTableIds, enabledTables, selectedTableId])
 
   useEffect(() => {
-    if (evidence.set && !['stale', 'generating'].includes(evidence.set.status)) return
+    if (!shouldPollEvidenceSet(evidence.set?.status)) return
     const timer = window.setInterval(() => {
       void loadEvidence().catch(() => undefined)
     }, 5000)
@@ -597,7 +677,11 @@ export function SemanticAccessPolicyWorkspaceV2({
     return () => window.clearInterval(timer)
   }, [apiPath, generationRun, loadEvidence])
 
-  const openTarget = useCallback(async (target: SemanticAccessTargetSummary) => {
+  const openTarget = useCallback(async (
+    target: SemanticAccessTargetSummary,
+    bootstrapOverride?: SemanticAccessBootstrapRun | null,
+  ) => {
+    const activeBootstrapRun = bootstrapOverride === undefined ? bootstrapRun : bootstrapOverride
     setSelectedTarget(target)
     setTargetLoading(true)
     setError('')
@@ -605,10 +689,10 @@ export function SemanticAccessPolicyWorkspaceV2({
     setSuggestion(null)
     setSourceText('')
     try {
-      if (bootstrapRun?.status === 'review_ready') {
+      if (activeBootstrapRun?.status === 'review_ready') {
         const draft = await semanticAccessRequest<BootstrapTargetResponse>(
           apiPath(
-            `/access-bootstrap/runs/${bootstrapRun.run_id}/targets/${target.target_type}/${encodeURIComponent(target.target_id)}`,
+            `/access-bootstrap/runs/${activeBootstrapRun.run_id}/targets/${target.target_type}/${encodeURIComponent(target.target_id)}`,
           ),
         )
         const nextRules = draft.target.definition?.tables || []
@@ -623,8 +707,10 @@ export function SemanticAccessPolicyWorkspaceV2({
         })
         setRules(nextRules)
         setActiveRules(nextRules)
-        setIncludeDescendants(draft.target.include_descendants)
-        setActiveIncludeDescendants(draft.target.include_descendants)
+        setEffectiveRules(bootstrapEffectiveRules(
+          draft.effective_tables,
+          draft.active_definition?.tables || nextRules,
+        ))
         if (draft.target.base_binding_id) {
           setVersions(await semanticAccessRequest<SemanticAccessVersion[]>(
             apiPath(`/access-bindings/${draft.target.base_binding_id}/versions`),
@@ -641,8 +727,7 @@ export function SemanticAccessPolicyWorkspaceV2({
       setBinding(detail)
       setRules(nextRules)
       setActiveRules(nextRules)
-      setIncludeDescendants(detail.include_descendants)
-      setActiveIncludeDescendants(detail.include_descendants)
+      setEffectiveRules(detail.effective_tables || [])
       if (detail.binding_id) {
         setVersions(await semanticAccessRequest<SemanticAccessVersion[]>(
           apiPath(`/access-bindings/${detail.binding_id}/versions`),
@@ -654,12 +739,115 @@ export function SemanticAccessPolicyWorkspaceV2({
       setBinding(EMPTY_BINDING(datasourceId, target))
       setRules([])
       setActiveRules([])
+      setEffectiveRules([])
       setVersions([])
       setError(semanticAccessErrorMessage(cause, '策略加载失败'))
     } finally {
       setTargetLoading(false)
     }
   }, [apiPath, bootstrapRun, datasourceId])
+
+  const previewSimilarSuggestions = useCallback(async (
+    sourceTableId: number,
+    sourceBeforeRule: SemanticAccessTableRule | null,
+    nextBindingRevision: number,
+    nextBootstrapRun: SemanticAccessBootstrapRun | null,
+  ) => {
+    if (selectedTarget?.target_type !== 'org_unit') return
+    const requestToken = ++suggestionRequestToken.current
+    setSimilarSuggestionLoading(true)
+    const context: SimilarSuggestionContext = {
+      datasource_id: datasourceId,
+      org_unit_id: Number(selectedTarget.target_id),
+      source_table_id: sourceTableId,
+      source_before_rule: sourceBeforeRule,
+      expected_binding_revision: nextBindingRevision,
+      bootstrap_run_id: nextBootstrapRun?.run_id ?? null,
+      expected_bootstrap_revision: nextBootstrapRun?.revision ?? null,
+    }
+    try {
+      const result = await semanticAccessRequest<SemanticAccessSimilarSuggestionPreview>(
+        apiPath('/access-policy-similar-suggestions/preview'),
+        { method: 'POST', body: JSON.stringify(context) },
+      )
+      if (requestToken !== suggestionRequestToken.current || result.candidates.length === 0) return
+      setSimilarSuggestionContext(context)
+      setSimilarSuggestion(result)
+      setSelectedSimilarSuggestionIds(
+        result.candidates.filter(item => item.default_selected).map(item => item.candidate_id),
+      )
+    } catch {
+      // Suggestions are optional and must never turn a successful source save into an error.
+    } finally {
+      if (requestToken === suggestionRequestToken.current) {
+        setSimilarSuggestionLoading(false)
+      }
+    }
+  }, [apiPath, datasourceId, selectedTarget])
+
+  const dismissSimilarSuggestions = useCallback(() => {
+    suggestionRequestToken.current += 1
+    setSimilarSuggestionLoading(false)
+    setSimilarSuggestion(null)
+    setSimilarSuggestionContext(null)
+    setSelectedSimilarSuggestionIds([])
+  }, [])
+
+  const applySimilarSuggestions = useCallback(async () => {
+    if (!similarSuggestion || !similarSuggestionContext || selectedSimilarSuggestionIds.length === 0) return
+    setBusy('similar-suggestion-apply')
+    try {
+      const result = await semanticAccessRequest<SemanticAccessSimilarSuggestionApplyResult>(
+        apiPath('/access-policy-similar-suggestions/apply'),
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            ...similarSuggestionContext,
+            batch_fingerprint: similarSuggestion.batch_fingerprint,
+            candidate_ids: selectedSimilarSuggestionIds,
+          }),
+        },
+      )
+      dismissSimilarSuggestions()
+      let nextRun = bootstrapRun
+      if (bootstrapRun && result.bootstrap_revision != null) {
+        nextRun = { ...bootstrapRun, revision: result.bootstrap_revision }
+        setBootstrapRun(nextRun)
+      }
+      if (selectedTarget) await openTarget(selectedTarget, nextRun)
+      const refreshes: Promise<unknown>[] = [loadEvidence()]
+      if (nextRun?.status === 'review_ready') {
+        refreshes.push(
+          semanticAccessRequest<SemanticAccessBootstrapSuggestions>(
+            apiPath(`/access-bootstrap/runs/${nextRun.run_id}/suggestions`),
+          ).then(setBootstrapSuggestions),
+        )
+      }
+      await Promise.all(refreshes)
+      setNotice(
+        `${result.direct_table_ids.length} 张表已直接生效，${result.review_table_ids.length} 张表仍需复核`,
+      )
+    } catch (cause) {
+      dismissSimilarSuggestions()
+      setError(semanticAccessErrorMessage(cause, '相似修改应用失败，所选表均未调整'))
+    } finally {
+      setBusy('')
+    }
+  }, [
+    apiPath,
+    bootstrapRun,
+    dismissSimilarSuggestions,
+    loadEvidence,
+    openTarget,
+    selectedSimilarSuggestionIds,
+    selectedTarget,
+    similarSuggestion,
+    similarSuggestionContext,
+  ])
+
+  useEffect(() => {
+    dismissSimilarSuggestions()
+  }, [area, dismissSimilarSuggestions, selectedTableId, selectedTarget?.target_id, selectedTarget?.target_type])
 
   useEffect(() => {
     if (!loading && area === 'baseline' && baselineTarget && !selectedTarget) {
@@ -757,11 +945,12 @@ export function SemanticAccessPolicyWorkspaceV2({
 
   const updateRule = (patch: Partial<SemanticAccessTableRule>) => {
     if (!currentTable) return
+    const seed = currentRule || currentEffectiveRule?.override_seed
     const next: SemanticAccessTableRule = {
       table_id: currentTable.id,
       hidden_column_ids: [],
       hidden_metric_ids: [],
-      ...currentRule,
+      ...seed,
       ...patch,
     }
     if ('decision' in patch) {
@@ -771,11 +960,13 @@ export function SemanticAccessPolicyWorkspaceV2({
         const suggestedScope = draftTarget?.candidates.find(
           candidate => candidate.table_id === currentTable.id,
         )?.row_scope
-        next.row_scope = suggestedScope === 'target_org_tree'
-          ? { type: 'target_org_tree' }
-          : suggestedScope === 'all' || selectedTarget?.target_type === 'baseline'
-            ? { type: 'all' }
-            : { type: 'target_org' }
+        next.row_scope = suggestedScope && typeof suggestedScope === 'object'
+          ? suggestedScope
+          : suggestedScope === 'target_org_tree'
+            ? { type: 'target_org_tree' }
+            : suggestedScope === 'all' || selectedTarget?.target_type === 'baseline'
+              ? { type: 'all' }
+              : { type: 'target_org' }
       }
     }
     if (next.decision == null) {
@@ -788,28 +979,39 @@ export function SemanticAccessPolicyWorkspaceV2({
     }
   }
 
-  const saveDraftTarget = useCallback(async (): Promise<boolean> => {
-    if (!selectedTarget || !bootstrapRun || !canManage) return false
-    setBusy('draft-save')
+  const restoreInheritedRule = () => {
+    if (!currentTable) return
+    setRules(previous => previous.filter(item => item.table_id !== currentTable.id))
+  }
+
+  const publishCurrentTables = useCallback(async (
+    tableIds: number[],
+    successMessage: string,
+  ): Promise<boolean> => {
+    if (!selectedTarget || !bootstrapRun || !canManage || !tableIds.length) return false
+    setBusy(tableIds.length === 1 ? `evidence-table:${tableIds[0]}` : 'evidence-target')
     setError('')
     setNotice('')
+    const sourceBeforeRule = tableIds.length === 1
+      ? activeRules.find(item => item.table_id === tableIds[0]) || null
+      : null
     try {
-      const result = await semanticAccessRequest<BootstrapTargetResponse>(
+      const result = await semanticAccessRequest<BootstrapTablePublishResponse>(
         apiPath(
-          `/access-bootstrap/runs/${bootstrapRun.run_id}/targets/${selectedTarget.target_type}/${encodeURIComponent(selectedTarget.target_id)}`,
+          `/access-bootstrap/runs/${bootstrapRun.run_id}/targets/${selectedTarget.target_type}/${encodeURIComponent(selectedTarget.target_id)}/publish-tables`,
         ),
         {
-          method: 'PUT',
+          method: 'POST',
           body: JSON.stringify({
             expected_revision: bootstrapRun.revision,
+            table_ids: tableIds,
             definition: {
               name: selectedTarget.label,
               tables: savableRules,
             },
-            include_descendants: selectedTarget.target_type === 'org_unit'
-              ? includeDescendants
-              : false,
+            include_descendants: selectedTarget.target_type === 'org_unit',
             reason: sourceText.trim() || null,
+            confirm_warnings: true,
           }),
         },
       )
@@ -817,23 +1019,55 @@ export function SemanticAccessPolicyWorkspaceV2({
       setDraftTarget(result.target)
       setRules(result.target.definition.tables || [])
       setActiveRules(result.target.definition.tables || [])
-      setActiveIncludeDescendants(result.target.include_descendants)
-      setBootstrapSuggestions(await semanticAccessRequest<SemanticAccessBootstrapSuggestions>(
-        apiPath(`/access-bootstrap/runs/${result.run.run_id}/suggestions`),
-      ))
-      setNotice('当前授权对象已保存到首次权限草稿，尚未发布生效。')
+      setBinding(current => current && ({
+        ...current,
+        id: result.binding_id,
+        binding_id: result.binding_id,
+        revision: result.binding_revision,
+        active_version_id: result.version_id,
+        include_descendants: result.target.include_descendants,
+        active_version: {
+          id: result.version_id,
+          binding_id: result.binding_id,
+          version: result.version,
+          definition: result.active_definition,
+        },
+      }))
+      const [nextEvidence, nextSuggestions] = await Promise.all([
+        semanticAccessRequest<EvidencePayload>(
+          apiPath(`/access-evidence/sets/${evidence.set?.id}`),
+        ),
+        semanticAccessRequest<SemanticAccessBootstrapSuggestions>(
+          apiPath(`/access-bootstrap/runs/${result.run.run_id}/suggestions`),
+        ),
+      ])
+      setEvidence(nextEvidence)
+      setBootstrapSuggestions(nextSuggestions)
+      await openTarget(selectedTarget, result.run)
+      if (tableIds.length === 1) {
+        await previewSimilarSuggestions(
+          tableIds[0],
+          sourceBeforeRule,
+          result.binding_revision,
+          result.run,
+        )
+      }
+      setNotice(`${successMessage}，权限已立即生效`)
       return true
     } catch (cause) {
-      setError(semanticAccessErrorMessage(cause, '首次权限草稿保存失败'))
+      setError(semanticAccessErrorMessage(cause, '权限保存失败，原有生效版本保持不变'))
       return false
     } finally {
       setBusy('')
     }
   }, [
     apiPath,
+    activeRules,
     bootstrapRun,
     canManage,
-    includeDescendants,
+    evidence.set?.id,
+    openTarget,
+    previewSimilarSuggestions,
     savableRules,
     selectedTarget,
     sourceText,
@@ -844,6 +1078,10 @@ export function SemanticAccessPolicyWorkspaceV2({
     setBusy('save')
     setError('')
     setNotice('')
+    const sourceTableId = currentTable?.id || 0
+    const sourceBeforeRule = sourceTableId
+      ? activeRules.find(item => item.table_id === sourceTableId) || null
+      : null
     try {
       const result = await semanticAccessRequest<SemanticAccessBinding & {
         audit_id?: number
@@ -854,9 +1092,7 @@ export function SemanticAccessPolicyWorkspaceV2({
         body: JSON.stringify({
           datasource_id: datasourceId,
           expected_revision: binding.revision,
-          include_descendants: selectedTarget.target_type === 'org_unit'
-            ? includeDescendants
-            : false,
+          include_descendants: selectedTarget.target_type === 'org_unit',
           definition: {
             name: selectedTarget.label,
             tables: savableRules,
@@ -868,8 +1104,7 @@ export function SemanticAccessPolicyWorkspaceV2({
       setBinding(result)
       setRules(savableRules)
       setActiveRules(savableRules)
-      setActiveIncludeDescendants(includeDescendants)
-      setNotice(`版本 v${result.active_version?.version || result.revision} 已生效 · 影响 ${result.affected_user_count ?? 0} 个账号${result.audit_id ? ` · 审计 #${result.audit_id}` : ''}`)
+      if (selectedTarget) await openTarget(selectedTarget)
       if (result.binding_id) {
         setVersions(await semanticAccessRequest<SemanticAccessVersion[]>(
           apiPath(`/access-bindings/${result.binding_id}/versions`),
@@ -881,6 +1116,15 @@ export function SemanticAccessPolicyWorkspaceV2({
       ])
       setOrgTargets(orgPage.items)
       setBaselineTarget(baselinePage.items[0] || null)
+      if (sourceTableId) {
+        await previewSimilarSuggestions(
+          sourceTableId,
+          sourceBeforeRule,
+          result.revision,
+          null,
+        )
+      }
+      setNotice(`版本 v${result.active_version?.version || result.revision} 已生效 · 影响 ${result.affected_user_count ?? 0} 个账号`)
       return true
     } catch (cause) {
       if (cause instanceof SemanticAccessApiError
@@ -896,20 +1140,24 @@ export function SemanticAccessPolicyWorkspaceV2({
     }
   }, [
     apiPath,
+    activeRules,
     binding,
     canManage,
+    currentTable?.id,
     datasourceId,
-    includeDescendants,
     loadTargets,
+    openTarget,
+    previewSimilarSuggestions,
     savableRules,
     selectedTarget,
     sourceText,
   ])
 
-  const saveCurrent = useCallback(
-    () => initialReviewMode ? saveDraftTarget() : save(),
-    [initialReviewMode, save, saveDraftTarget],
-  )
+  const saveCurrent = useCallback(() => {
+    if (!initialReviewMode) return save()
+    if (!currentTable) return Promise.resolve(false)
+    return publishCurrentTables([currentTable.id], `${currentTable.business_name} 已确认`)
+  }, [currentTable, initialReviewMode, publishCurrentTables, save])
 
   const generateFirstPermissions = async () => {
     setBusy('evidence-generate')
@@ -953,42 +1201,25 @@ export function SemanticAccessPolicyWorkspaceV2({
     mode: 'table' | 'ordinary_target' | 'target',
     tableId?: number,
   ) => {
-    if (!evidence.set) return
-    const targetType = area === 'baseline' ? 'baseline' : 'org_unit'
-    const targetId = area === 'baseline' ? '*' : String(
-      selectedOrg?.level === 0
-        ? selectedOrg.id
-        : Number(selectedOrg?.ancestors.split('/').filter(Boolean)[0] || selectedOrg?.id),
-    )
-    if (!targetId || targetId === 'undefined') return
-    setBusy(mode === 'table' ? `evidence-table:${tableId}` : 'evidence-target')
-    setError('')
-    try {
-      const next = await semanticAccessRequest<EvidencePayload & {
-        confirmation?: { assets: number; relations: number }
-      }>(apiPath(
-        `/access-evidence/sets/${evidence.set.id}/targets/${targetType}/${encodeURIComponent(targetId)}/confirm`,
-      ), {
-        method: 'POST',
-        body: JSON.stringify({
-          expected_revision: evidence.set.revision,
-          mode,
-          table_id: tableId || null,
-        }),
-      })
-      setEvidence(next)
-      setNotice(mode === 'table'
-        ? '本表的表权限与字段配置已确认。'
-        : mode === 'target'
-          ? targetType === 'baseline'
-            ? '全员基线的全部配置已确认。'
-            : '本部门的全部配置已确认，包括敏感与高风险配置。'
-          : '当前授权对象的普通授权已确认。')
+    if (!evidence.set || !selectedTarget) return
+    const tableIds = mode === 'table' && tableId
+      ? [tableId]
+      : mode === 'ordinary_target'
+        ? [...evidenceConfirmationsByTable.entries()]
+          .filter(([, confirmation]) => (
+            confirmation.tablePendingItems > 0
+            && confirmation.pendingRiskTableIds.length === 0
+          ))
+          .map(([pendingTableId]) => pendingTableId)
+        : enabledTables.map(table => table.id)
+    if (!tableIds.length) return
+    const label = mode === 'table'
+      ? `${enabledTables.find(table => table.id === tableId)?.business_name || '本表'} 已确认`
+      : selectedTarget.target_type === 'baseline'
+        ? '全员基线已确认'
+        : '本部门权限已确认'
+    if (await publishCurrentTables(tableIds, label)) {
       if (mode === 'target') setDepartmentConfirmOpen(false)
-    } catch (cause) {
-      setError(semanticAccessErrorMessage(cause, '授权确认失败'))
-    } finally {
-      setBusy('')
     }
   }
 
@@ -1043,6 +1274,7 @@ export function SemanticAccessPolicyWorkspaceV2({
       setVersions(await semanticAccessRequest<SemanticAccessVersion[]>(
         apiPath(`/access-bindings/${binding.binding_id}/versions`),
       ))
+      if (selectedTarget) await openTarget(selectedTarget)
       setNotice(`已从 v${version.version} 生成新的生效版本。`)
     } catch (cause) {
       setError(semanticAccessErrorMessage(cause, '回滚失败，旧版本仍在生效'))
@@ -1116,43 +1348,6 @@ export function SemanticAccessPolicyWorkspaceV2({
     } finally {
       setBusy('')
     }
-  }
-
-  const confirmEvidence = async () => {
-    if (!bootstrapRun) return
-    setBusy('evidence-confirm')
-    setError('')
-    try {
-      await semanticAccessRequest(
-        apiPath(`/access-bootstrap/runs/${bootstrapRun.run_id}/apply`),
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            expected_revision: bootstrapRun.revision,
-            confirm_warnings: true,
-          }),
-        },
-      )
-      setPublishDialogOpen(false)
-      setNotice('首次权限草稿已确定性编译并原子发布。')
-      await loadBase()
-    } catch (cause) {
-      setError(semanticAccessErrorMessage(cause, '首次权限发布失败，原有权限保持不变'))
-      await loadEvidence().catch(() => undefined)
-    } finally {
-      setBusy('')
-    }
-  }
-
-  const openPublishDialog = async () => {
-    if (!bootstrapRun) return
-    if (isDirty && !await saveDraftTarget()) return
-    const next = await semanticAccessRequest<SemanticAccessBootstrapSuggestions>(
-      apiPath(`/access-bootstrap/runs/${bootstrapRun.run_id}/suggestions`),
-    )
-    setBootstrapRun(next.run)
-    setBootstrapSuggestions(next)
-    setPublishDialogOpen(true)
   }
 
   const retryEvidence = async () => {
@@ -1281,33 +1476,6 @@ export function SemanticAccessPolicyWorkspaceV2({
             <RefreshCw className={cn('h-4 w-4', loading && 'animate-spin')} />
             <span className="hidden sm:inline">刷新</span>
           </Button>
-          {canManage && (
-            <Button
-              onClick={() => initialReviewMode
-                ? void openPublishDialog()
-                : void save()}
-              disabled={
-                initialReviewMode
-                  ? !bootstrapSuggestions
-                    || bootstrapBlockers.length > 0
-                    || Boolean(busy)
-                  : Boolean(evidenceReadiness?.access_bootstrap_required)
-                    || !isDirty || busy === 'save' || !selectedTarget
-              }
-              title={
-                evidenceReadiness?.access_bootstrap_required && !initialReviewMode
-                  ? '请先生成首次权限草稿'
-                  : initialReviewMode && bootstrapBlockers.length > 0
-                    ? `还有 ${bootstrapBlockers.length} 个阻断项`
-                    : undefined
-              }
-            >
-              {['save', 'draft-save', 'evidence-confirm'].includes(busy)
-                ? <Loader2 className="h-4 w-4 animate-spin" />
-                : <Save className="h-4 w-4" />}
-              <span className="hidden sm:inline">保存并生效</span>
-            </Button>
-          )}
           <Button variant="outline" onClick={() => guarded(onClose)}><ArrowLeft className="h-4 w-4" />返回</Button>
         </div>
       </header>
@@ -1319,8 +1487,12 @@ export function SemanticAccessPolicyWorkspaceV2({
             ? 'border-red-500/20 bg-red-500/10 text-red-300'
             : 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300',
         )}>
-          {error ? <CircleAlert className="h-4 w-4" /> : <Check className="h-4 w-4" />}
-          <span className="min-w-0 flex-1 truncate">{error || notice}</span>
+          {error
+            ? <CircleAlert className="h-4 w-4" />
+            : <Check className="h-4 w-4" />}
+          <span className="min-w-0 flex-1 truncate">
+            {error || notice}
+          </span>
           <button onClick={() => { setError(''); setNotice('') }} className="text-xs underline">关闭</button>
         </div>
       )}
@@ -1382,12 +1554,8 @@ export function SemanticAccessPolicyWorkspaceV2({
                     area={area}
                     selectedOrg={selectedOrg}
                     targetTab={targetTab}
-                    selectedTarget={selectedTarget}
-                    includeDescendants={includeDescendants}
-                    canManage={canManage}
                     draftMode={initialReviewMode}
                     actions={directPolicyActions}
-                    onIncludeDescendants={setIncludeDescendants}
                     onSelectTab={selectTab}
                   />
 
@@ -1423,7 +1591,7 @@ export function SemanticAccessPolicyWorkspaceV2({
                               <h2 className="truncate font-semibold">{selectedTarget.label}</h2>
                               <TargetStatus
                                 target={selectedTarget}
-                                configured={Boolean(binding.active_version_id)}
+                                configured={rules.length > 0}
                                 draft={initialReviewMode && Boolean(draftTarget)}
                               />
                             </div>
@@ -1460,19 +1628,27 @@ export function SemanticAccessPolicyWorkspaceV2({
                             selectedTableId={currentTable?.id || 0}
                             currentTable={currentTable}
                             rule={currentRule}
-                            rules={rules}
+                            activeRules={activeRules}
+                            effectiveRules={effectiveRules}
                             candidates={draftTarget?.candidates || []}
                             draftMode={initialReviewMode}
                             canManage={canManage}
                             canManageWorkspace={canManageWorkspace}
                             highRiskTableIds={highRiskTableIds}
                             sensitiveTableIds={sensitiveTableIds}
+                            confirmationsByTable={evidenceConfirmationsByTable}
+                            inheritedEvidenceReviewsByTable={inheritedEvidenceReviewsByTable}
                             confirmation={evidenceConfirmation || undefined}
-                            confirmBusy={busy === `evidence-table:${currentTable?.id}`}
+                            dirty={currentTableDirty}
+                            confirmBusy={
+                              busy === `evidence-table:${currentTable?.id}`
+                              || busy === 'save'
+                            }
+                            similarSuggestionLoading={similarSuggestionLoading}
                             onSelectTable={setSelectedTableId}
                             onUpdateRule={updateRule}
-                            onConfirmTable={() => currentTable
-                              && void confirmEvidenceTarget('table', currentTable.id)}
+                            onRestoreInherited={restoreInheritedRule}
+                            onSaveTable={saveCurrent}
                           />
                         )}
                       </>
@@ -1633,67 +1809,6 @@ export function SemanticAccessPolicyWorkspaceV2({
         </DialogContent>
       </Dialog>
 
-      <Dialog open={publishDialogOpen} onOpenChange={setPublishDialogOpen}>
-        <DialogContent className="max-w-2xl border-manus-border bg-manus-secondary">
-          <DialogHeader>
-            <DialogTitle>保存并生效首次权限</DialogTitle>
-            <DialogDescription>系统会一次发布当前全部首次权限草稿；失败时现有权限保持不变。</DialogDescription>
-          </DialogHeader>
-          <div className="min-h-44">
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-                <SummaryCountCard
-                  title="草稿策略"
-                  value={bootstrapSuggestions?.targets.length || 0}
-                  complete={Boolean(bootstrapSuggestions?.targets.length)}
-                />
-                <SummaryCountCard
-                  title="低置信度"
-                  value={
-                    (bootstrapRun?.summary.low_confidence_table_count || 0)
-                    + (bootstrapRun?.summary.low_confidence_field_count || 0)
-                  }
-                  complete={
-                    (bootstrapRun?.summary.low_confidence_table_count || 0)
-                    + (bootstrapRun?.summary.low_confidence_field_count || 0) === 0
-                  }
-                />
-                <SummaryCountCard
-                  title="敏感资产"
-                  value={
-                    (bootstrapRun?.summary.sensitive_table_count || 0)
-                    + (bootstrapRun?.summary.sensitive_field_count || 0)
-                  }
-                  complete
-                />
-                <SummaryCountCard
-                  title="阻断项"
-                  value={bootstrapBlockers.length}
-                  complete={bootstrapBlockers.length === 0}
-                />
-            </div>
-            {bootstrapBlockers.length > 0 && (
-              <div className="mt-3 rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-xs text-red-300">
-                {bootstrapBlockers.map(item => item.message).join('；')}
-              </div>
-            )}
-          </div>
-          <DialogFooter className="gap-2">
-            <Button variant="outline" onClick={() => setPublishDialogOpen(false)}>返回继续配置</Button>
-            <Button
-              onClick={() => void confirmEvidence()}
-              disabled={
-                !bootstrapSuggestions
-                || busy === 'evidence-confirm'
-                || bootstrapBlockers.length > 0
-              }
-            >
-              {busy === 'evidence-confirm' && <Loader2 className="h-4 w-4 animate-spin" />}
-              确认并原子发布
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
       <Dialog open={matrixOpen} onOpenChange={setMatrixOpen}>
         <DialogContent className="flex h-[90vh] w-[min(96vw,1540px)] max-w-none flex-col overflow-hidden border-manus-border bg-manus-secondary">
           <DialogHeader>
@@ -1716,6 +1831,75 @@ export function SemanticAccessPolicyWorkspaceV2({
           ) : (
             <CenteredState icon={<Inbox />} title="暂无矩阵数据" />
           )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(similarSuggestion)}
+        onOpenChange={open => { if (!open) dismissSimilarSuggestions() }}
+      >
+        <DialogContent className="flex max-h-[82vh] w-[min(94vw,920px)] max-w-none flex-col overflow-hidden border-manus-border bg-manus-secondary">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-manus-text">
+              <Sparkles className="h-5 w-5 text-emerald-500" />
+              相似修改建议
+            </DialogTitle>
+            <DialogDescription>
+              发现其他表存在相似字段。勾选后，可将本次权限调整同步到所选表。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="min-h-0 overflow-auto rounded-xl border border-manus-border">
+            <div className="grid min-w-[820px] grid-cols-[44px_minmax(140px,1fr)_minmax(140px,1fr)_minmax(220px,1.6fr)_140px] gap-3 border-b border-manus-border bg-manus-tertiary/70 px-4 py-3 text-xs font-medium text-manus-muted">
+              <span />
+              <span>数据表</span>
+              <span>匹配字段</span>
+              <span>权限调整</span>
+              <span>应用后状态</span>
+            </div>
+            {(similarSuggestion?.candidates || []).map(candidate => {
+              const checked = selectedSimilarSuggestionIds.includes(candidate.candidate_id)
+              return (
+                <label
+                  key={candidate.candidate_id}
+                  className="grid min-w-[820px] cursor-pointer grid-cols-[44px_minmax(140px,1fr)_minmax(140px,1fr)_minmax(220px,1.6fr)_140px] items-center gap-3 border-b border-manus-border px-4 py-3 last:border-b-0 hover:bg-manus-hover"
+                >
+                  <Checkbox
+                    checked={checked}
+                    disabled={busy === 'similar-suggestion-apply'}
+                    onCheckedChange={next => setSelectedSimilarSuggestionIds(current => (
+                      next
+                        ? [...new Set([...current, candidate.candidate_id])]
+                        : current.filter(id => id !== candidate.candidate_id)
+                    ))}
+                  />
+                  <span className="min-w-0">
+                    <b className="block truncate text-sm font-medium text-manus-text">{candidate.table_name}</b>
+                    {candidate.expands_access && <Pill tone="amber">扩大权限</Pill>}
+                  </span>
+                  <span className="text-sm text-manus-text">{candidate.matched_fields.join('、')}</span>
+                  <span className="space-y-1 text-sm text-manus-text">
+                    {candidate.adjustments.map(item => <span key={item} className="block">{item}</span>)}
+                  </span>
+                  <Pill tone={candidate.apply_status === 'direct' ? 'green' : 'amber'}>
+                    {candidate.apply_status === 'direct' ? '直接生效' : '应用后仍需复核'}
+                  </Pill>
+                </label>
+              )
+            })}
+          </div>
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={dismissSimilarSuggestions} disabled={busy === 'similar-suggestion-apply'}>
+              暂不处理
+            </Button>
+            <Button
+              onClick={() => void applySimilarSuggestions()}
+              disabled={selectedSimilarSuggestionIds.length === 0 || busy === 'similar-suggestion-apply'}
+              className="bg-emerald-500 text-white hover:bg-emerald-600"
+            >
+              {busy === 'similar-suggestion-apply' && <Loader2 className="h-4 w-4 animate-spin" />}
+              应用到已选表
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 
@@ -1868,16 +2052,12 @@ function PolicyDot({ configured, draft = false }: { configured: boolean; draft?:
   )} />
 }
 
-function TargetHeader({ area, selectedOrg, targetTab, selectedTarget, includeDescendants, canManage, draftMode, actions, onIncludeDescendants, onSelectTab }: {
+function TargetHeader({ area, selectedOrg, targetTab, draftMode, actions, onSelectTab }: {
   area: Area
   selectedOrg: OrgUnit | null
   targetTab: TargetTab
-  selectedTarget: SemanticAccessTargetSummary | null
-  includeDescendants: boolean
-  canManage: boolean
   draftMode: boolean
   actions?: ReactNode
-  onIncludeDescendants: (checked: boolean) => void
   onSelectTab: (tab: TargetTab) => void
 }) {
   const title = area === 'baseline' ? '全员基线' : area === 'unassigned' ? '待分配账号' : selectedOrg?.name || '请选择部门'
@@ -1909,19 +2089,9 @@ function TargetHeader({ area, selectedOrg, targetTab, selectedTarget, includeDes
             </p>
           )}
         </div>
-        {(actions || (
-          area === 'organization'
-          && targetTab === 'org_unit'
-          && selectedTarget?.target_type === 'org_unit'
-        )) && (
+        {actions && (
           <div className="flex flex-wrap items-center justify-end gap-2">
             {actions}
-            {area === 'organization' && targetTab === 'org_unit' && selectedTarget?.target_type === 'org_unit' && (
-              <div className="flex items-center gap-3 rounded-lg border border-manus-border bg-manus-tertiary px-3 py-2">
-                <div><div className="text-xs font-medium">包含下级部门</div><div className="text-[11px] text-manus-muted">影响约 {selectedTarget.affected_user_count} 个账号</div></div>
-                <Switch checked={includeDescendants} onCheckedChange={onIncludeDescendants} disabled={!canManage} />
-              </div>
-            )}
           </div>
         )}
       </div>
@@ -1980,7 +2150,7 @@ function TargetList({ area, targetTab, targets, selectedTarget, search, loading,
   )
 }
 
-function PolicyEditor({ tables, columns, metrics, organizations, target, selectedTableId, currentTable, rule, rules, candidates, draftMode, canManage, canManageWorkspace, highRiskTableIds, sensitiveTableIds, confirmation, confirmBusy, onSelectTable, onUpdateRule, onConfirmTable }: {
+function PolicyEditor({ tables, columns, metrics, organizations, target, selectedTableId, currentTable, rule, activeRules, effectiveRules, candidates, draftMode, canManage, canManageWorkspace, highRiskTableIds, sensitiveTableIds, confirmationsByTable, inheritedEvidenceReviewsByTable, confirmation, dirty, confirmBusy, similarSuggestionLoading, onSelectTable, onUpdateRule, onRestoreInherited, onSaveTable }: {
   tables: SemanticTable[]
   columns: SemanticColumn[]
   organizations: OrgUnit[]
@@ -1989,19 +2159,28 @@ function PolicyEditor({ tables, columns, metrics, organizations, target, selecte
   selectedTableId: number
   currentTable?: SemanticTable
   rule?: SemanticAccessTableRule
-  rules: SemanticAccessTableRule[]
+  activeRules: SemanticAccessTableRule[]
+  effectiveRules: SemanticEffectiveTableRule[]
   candidates: SemanticAccessBootstrapCandidate[]
   draftMode: boolean
   canManage: boolean
   canManageWorkspace: boolean
   highRiskTableIds: Set<number>
   sensitiveTableIds: Set<number>
+  confirmationsByTable: Map<number, EvidenceConfirmationSummary>
+  inheritedEvidenceReviewsByTable: Map<number, InheritedEvidenceReview>
   confirmation?: EvidenceConfirmationSummary
+  dirty: boolean
   confirmBusy: boolean
+  similarSuggestionLoading: boolean
   onSelectTable: (id: number) => void
   onUpdateRule: (patch: Partial<SemanticAccessTableRule>) => void
-  onConfirmTable: () => void
+  onRestoreInherited: () => void
+  onSaveTable: () => Promise<boolean>
 }) {
+  const [reviewOnly, setReviewOnly] = useState(false)
+  const [tableDetailOpen, setTableDetailOpen] = useState(false)
+  const [fieldDetailsOpen, setFieldDetailsOpen] = useState(true)
   const candidateByTable = new Map(candidates.map(item => [item.table_id, item]))
   const currentCandidate = currentTable ? candidateByTable.get(currentTable.id) : undefined
   const currentTableIsHighRisk = Boolean(
@@ -2010,217 +2189,458 @@ function PolicyEditor({ tables, columns, metrics, organizations, target, selecte
   const currentTableIsSensitive = Boolean(
     currentTable && sensitiveTableIds.has(currentTable.id),
   )
-  return (
-    <div className="grid min-h-0 flex-1 grid-cols-1 md:grid-cols-[236px_minmax(0,1fr)]">
-      <div className="min-h-0 overflow-y-auto border-b border-manus-border p-2 md:border-b-0 md:border-r">
-        {tables.map(table => {
-          const tableRule = rules.find(item => item.table_id === table.id)
-          const tableCandidate = candidateByTable.get(table.id)
-          return (
-            <button key={table.id} onClick={() => onSelectTable(table.id)} className={cn(
-              'mb-1 w-full rounded-lg px-3 py-3 text-left transition-colors',
-              selectedTableId === table.id ? 'bg-manus-tertiary' : 'hover:bg-manus-hover',
+  const currentEffectiveRule = currentTable
+    ? effectiveRules.find(item => item.table_id === currentTable.id)
+    : undefined
+  const displayedRule = rule || currentEffectiveRule
+  const currentNeedsReview = authorizationNeedsReview(displayedRule?.decision, confirmation)
+  const currentConfidence = Math.round((currentCandidate?.confidence || 0) * 100)
+  const visibleSensitiveFields = columns.filter(column => (
+    column.is_sensitive
+    && displayedRule?.decision === 'visible'
+    && !(displayedRule.hidden_column_ids || []).includes(column.id)
+  ))
+  const currentReviewReason = currentNeedsReview
+    ? currentCandidate?.requires_mapping || (
+        currentCandidate?.row_scope_suggestion && (rule?.row_scope?.type || 'all') === 'all'
+      )
+      ? '行范围尚未明确'
+      : visibleSensitiveFields.length > 0
+        ? '包含可见敏感字段'
+        : isLowEvidenceConfidence(currentCandidate?.confidence)
+          ? '授权判断置信度偏低'
+          : currentTableIsHighRisk || currentTableIsSensitive
+            ? '高风险授权需确认'
+            : '授权建议待确认'
+    : displayedRule?.decision === 'hidden'
+      ? '当前为不可见，无需授权复核'
+      : confirmation?.tableConfirmed
+        ? '当前授权已经确认'
+        : '未发现待处理的授权风险'
+  const tableRows = tables.map(table => {
+    const {
+      rule: tableRule,
+      direct,
+      effectiveRule,
+    } = persistedSemanticAccessTableRule(table.id, activeRules, effectiveRules)
+    const candidate = candidateByTable.get(table.id)
+    const inheritedReview = direct
+      ? undefined
+      : inheritedEvidenceReviewsByTable.get(table.id)
+    const tableConfirmation = confirmationsByTable.get(table.id)
+      || inheritedReview?.confirmation
+    return {
+      table,
+      rule: tableRule,
+      direct,
+      effectiveRule,
+      candidate,
+      needsReview: authorizationNeedsReview(tableRule?.decision, tableConfirmation),
+      confirmed: Boolean(tableConfirmation?.tableConfirmed),
+      inheritedReviewSourceLabel: inheritedReview?.sourceLabel,
+    }
+  })
+  const visibleRows = tableRows.filter(item => (
+    item.rule?.decision === 'visible' && (!reviewOnly || item.needsReview)
+  ))
+  const unavailableRows = tableRows.filter(item => (
+    item.rule?.decision !== 'visible' && (!reviewOnly || item.needsReview)
+  ))
+  const openTableDetail = (tableId: number) => {
+    onSelectTable(tableId)
+    setFieldDetailsOpen(true)
+    setTableDetailOpen(true)
+  }
+  const saveTableDetail = async () => {
+    if (await onSaveTable()) setTableDetailOpen(false)
+  }
+
+  const renderTableRows = (items: typeof tableRows) => (
+    <div className="overflow-hidden rounded-xl border border-manus-border">
+      <div className="hidden grid-cols-[minmax(0,1.25fr)_minmax(130px,.75fr)_120px_minmax(145px,.8fr)_18px] gap-3 border-b border-manus-border bg-manus-tertiary px-4 py-2 text-[11px] font-medium text-manus-muted xl:grid">
+        <span>数据资产</span>
+        <span>当前部门决策</span>
+        <span>风险</span>
+        <span>复核状态</span>
+        <span />
+      </div>
+      {items.map(({ table, rule: tableRule, direct, effectiveRule, candidate, needsReview, confirmed, inheritedReviewSourceLabel }) => {
+        const confidence = Math.round((candidate?.confidence || 0) * 100)
+        const highRisk = highRiskTableIds.has(table.id)
+        const sensitive = sensitiveTableIds.has(table.id)
+        const reviewReason = needsReview
+          ? inheritedReviewSourceLabel
+            ? `${inheritedReviewSourceLabel}授权待确认`
+            : candidate?.requires_mapping || candidate?.row_scope_suggestion
+            ? '行范围尚未明确'
+            : isLowEvidenceConfidence(candidate?.confidence)
+              ? '置信度偏低'
+              : sensitive
+                ? '敏感授权待确认'
+                : highRisk
+                  ? '高风险授权待确认'
+                  : '授权建议待确认'
+          : confirmed
+            ? '已确认'
+            : tableRule?.decision === 'hidden'
+              ? '无需复核'
+              : '无待办'
+        return (
+          <button
+            key={table.id}
+            type="button"
+            aria-pressed={selectedTableId === table.id}
+            onClick={() => openTableDetail(table.id)}
+            className={cn(
+              'grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-b border-manus-border px-4 py-3 text-left transition-colors last:border-b-0 xl:grid-cols-[minmax(0,1.25fr)_minmax(130px,.75fr)_120px_minmax(145px,.8fr)_18px]',
+              selectedTableId === table.id ? 'bg-emerald-500/7' : 'hover:bg-manus-hover/60',
+            )}
+          >
+            <span className="min-w-0">
+              <b className="block truncate text-sm font-medium">{table.business_name}</b>
+              <span className="mt-0.5 block truncate font-mono text-[11px] text-manus-muted">{table.physical_name}</span>
+            </span>
+            <span className={cn(
+              'justify-self-end text-xs font-medium xl:justify-self-start',
+              tableRule?.decision === 'visible'
+                ? 'text-emerald-700 dark:text-emerald-300'
+                : 'text-manus-muted',
             )}>
-              <div className="truncate text-sm font-medium">{table.business_name}</div>
-              <div className="mt-1 truncate font-mono text-[11px] text-manus-muted">{table.physical_name}</div>
-              <div className={cn(
-                'mt-2 text-[11px]',
-                tableRule?.decision === 'visible' ? 'text-emerald-300' : tableRule?.decision === 'hidden' ? 'text-red-300' : 'text-manus-muted',
-              )}>{tableRule?.decision === 'visible' ? '直接可见' : tableRule?.decision === 'hidden' ? '明确不可见' : '跟随其他层级'}</div>
-              {(highRiskTableIds.has(table.id) || sensitiveTableIds.has(table.id)) && (
-                <div className="mt-2 flex flex-wrap gap-1">
-                  {highRiskTableIds.has(table.id) && (
-                    <span className="inline-flex rounded-full bg-amber-500/14 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300">
-                      高风险
-                    </span>
-                  )}
-                  {sensitiveTableIds.has(table.id) && (
-                    <span className="inline-flex rounded-full bg-rose-500/12 px-2 py-0.5 text-[10px] font-medium text-rose-700 dark:text-rose-300">
-                      含敏感字段
-                    </span>
-                  )}
-                </div>
-              )}
-              {draftMode && isLowEvidenceConfidence(tableCandidate?.confidence) && (
-                <span className="mt-2 inline-flex rounded-full bg-amber-500/14 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300">
-                  低置信度 &lt; 60%
+              {tableRule?.decision === 'visible'
+                ? '可见'
+                : '不可见'}
+              <span className="ml-1 font-normal text-manus-muted">
+                · {semanticAccessDecisionOriginLabel(
+                  target.target_type,
+                  direct,
+                  effectiveRule?.sources,
+                )}
+              </span>
+              {draftMode && candidate ? ` · 置信度${confidence}%` : ''}
+            </span>
+            <span className="hidden items-center gap-1.5 text-xs xl:flex">
+              {(highRisk || sensitive) ? (
+                <>
+                  <ShieldCheck className="h-3.5 w-3.5 text-amber-500" />
+                  <span className="text-amber-700 dark:text-amber-300">
+                    {sensitive ? '敏感' : '高风险'}
+                  </span>
+                </>
+              ) : <span className="text-manus-muted">一般</span>}
+            </span>
+            <span className="hidden items-center gap-2 text-xs xl:flex">
+              <span className={cn(
+                needsReview
+                  ? 'text-orange-700 dark:text-orange-300'
+                  : confirmed
+                    ? 'text-emerald-700 dark:text-emerald-300'
+                    : 'text-manus-muted',
+              )}>{reviewReason}</span>
+              {needsReview && (
+                <span className="rounded-full bg-orange-500/12 px-2 py-0.5 text-[10px] font-medium text-orange-700 dark:text-orange-300">
+                  需复核
                 </span>
               )}
-            </button>
-          )
-        })}
+            </span>
+            <ChevronRight className="hidden h-4 w-4 text-manus-muted xl:block" />
+          </button>
+        )
+      })}
+      {items.length === 0 && (
+        <div className="px-4 py-8 text-center text-sm text-manus-muted">当前筛选下没有数据资产</div>
+      )}
+    </div>
+  )
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="min-h-0 flex-1 overflow-y-auto p-4 lg:p-5">
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 className="font-semibold">{target.label}数据资产</h3>
+            <p className="mt-1 text-xs text-manus-muted">优先核对当前部门的访问决定，再查看数据本身的风险。</p>
+          </div>
+          {draftMode && (
+            <label className="flex items-center gap-2 text-xs text-manus-muted">
+              <Switch checked={reviewOnly} onCheckedChange={setReviewOnly} />
+              仅看需复核
+            </label>
+          )}
+        </div>
+        <section>
+          <div className="mb-2 flex items-center justify-between">
+            <h4 className="text-sm font-medium">{target.label}可见资产</h4>
+            <span className="text-xs text-manus-muted">{visibleRows.length} 张</span>
+          </div>
+          {renderTableRows(visibleRows)}
+        </section>
+        <section className="mt-5">
+          <div className="mb-2 flex items-center justify-between">
+            <h4 className="text-sm font-medium">{target.label}不可见资产</h4>
+            <span className="text-xs text-manus-muted">{unavailableRows.length} 张</span>
+          </div>
+          {renderTableRows(unavailableRows)}
+        </section>
       </div>
-      <div className="min-h-0 overflow-y-auto p-4 md:p-5">
+      <Dialog
+        open={tableDetailOpen && Boolean(currentTable)}
+        onOpenChange={open => {
+          if (!open && (confirmBusy || similarSuggestionLoading)) return
+          setTableDetailOpen(open)
+        }}
+      >
+        <DialogContent className="flex h-[min(92vh,900px)] w-[min(96vw,1200px)] max-w-none flex-col gap-0 overflow-hidden border-manus-border bg-manus-secondary p-0 shadow-2xl">
+          <DialogHeader className="shrink-0 border-b border-manus-border bg-manus-elevated px-6 py-4 pr-14">
+            <div className="flex flex-wrap items-center gap-3">
+              <DialogTitle className="text-xl text-manus-text">{currentTable?.business_name || '表权限详情'}</DialogTitle>
+              <Pill tone={displayedRule?.decision === 'visible' ? 'green' : 'neutral'}>
+                {displayedRule?.decision === 'visible' ? '可见' : '不可见'}
+              </Pill>
+              {confirmation?.tableConfirmed && (
+                <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700 dark:text-emerald-300"><Check className="h-3.5 w-3.5" />已确认</span>
+              )}
+            </div>
+            <DialogDescription className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+              <span className="font-mono">{currentTable?.physical_name}</span>
+              <span aria-hidden="true">·</span>
+              <span>{target.label}的访问设置</span>
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid min-h-0 flex-1 overflow-hidden lg:grid-cols-[330px_minmax(0,1fr)]">
         {currentTable ? (
           <>
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div><h3 className="font-semibold">{currentTable.business_name}</h3><code className="text-xs text-manus-muted">{currentTable.physical_name}</code></div>
+            <aside className="min-h-0 overflow-y-auto border-b border-manus-border bg-manus/20 p-5 lg:border-b-0 lg:border-r">
+            <div className="rounded-xl border border-manus-border bg-manus-elevated p-4">
               <div className="flex flex-wrap items-center gap-2">
-                {draftMode && confirmation && confirmation.tablePendingItems > 0 && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={onConfirmTable}
-                    disabled={!canManage || !canManageWorkspace || confirmBusy}
-                  >
-                    {confirmBusy
-                      ? <Loader2 className="h-4 w-4 animate-spin" />
-                      : <Check className="h-4 w-4" />}
-                    确认本表
-                  </Button>
-                )}
-                {draftMode && confirmation?.tableConfirmed && (
-                  <Badge
-                    variant="outline"
-                    className="border-emerald-500/35 bg-emerald-500/10 text-emerald-300"
-                  >
-                    <Check className="mr-1 h-3.5 w-3.5" />
-                    本表已确认
-                  </Badge>
-                )}
-                <DecisionSelector value={rule?.decision} disabled={!canManage} onChange={decision => onUpdateRule({ decision })} />
-              </div>
-            </div>
-
-            {(currentTableIsHighRisk || currentTableIsSensitive) && (
-              <div className="mt-4 flex gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-900">
-                <CircleAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
-                <div>
-                  <div className="font-medium">
-                    {currentTableIsHighRisk && currentTableIsSensitive
-                      ? '此表属于高风险表并包含敏感字段'
-                      : currentTableIsHighRisk
-                        ? '此表属于高风险表'
-                        : '此表包含敏感字段'}
+                {draftMode && currentCandidate && (
+                  <div className="flex w-full items-center justify-between gap-3">
+                    <span className="text-xs text-manus-muted">系统建议置信度</span>
+                    <b className="text-lg tabular-nums">{currentConfidence}%</b>
                   </div>
-                  <p className="mt-1 leading-5 text-amber-800">
-                    请重点核对表权限与敏感字段的可见状态；“确认本表”会一并接受当前表的相关建议。
-                  </p>
-                </div>
+                )}
+                {currentNeedsReview && (
+                  <span className="rounded-full bg-orange-500/12 px-2 py-0.5 text-xs font-medium text-orange-700 dark:text-orange-300">需复核</span>
+                )}
               </div>
-            )}
-
-            {draftMode && currentCandidate && (
-              <details className="mt-4 rounded-lg border border-manus-border bg-manus-tertiary px-3 py-2.5 text-xs text-manus-muted">
-                <summary className="cursor-pointer font-medium text-manus-text">
-                  生成依据 · 置信度 {Math.round((currentCandidate.confidence || 0) * 100)}%
-                  {currentCandidate.sensitive ? ' · 敏感表' : ''}
-                </summary>
-                <p className="mt-2 leading-5">{currentCandidate.reason || '未提供额外依据说明'}</p>
-              </details>
-            )}
-
-            {rule?.decision === 'visible' && (
-              <RowScopeEditor
-                value={rule.row_scope}
-                target={target}
-                organizations={organizations}
-                columns={columns}
-                canManageWorkspace={canManageWorkspace}
-                disabled={!canManage}
-                onChange={row_scope => onUpdateRule({ row_scope })}
-              />
-            )}
-
-            <h4 className="mb-3 mt-6 text-sm font-medium">字段可见性</h4>
-            <div className="grid gap-2 sm:grid-cols-2">
-              {columns.map(column => {
-                const fieldCandidate = currentCandidate?.field_suggestions?.find(
-                  item => item.column_id === column.id,
-                )
-                const followsHiddenTable = rule?.decision === 'hidden'
-                const hidden = followsHiddenTable || rule?.hidden_column_ids.includes(column.id)
-                return (
-                  <button
-                    key={column.id}
-                    disabled={!canManage || rule?.decision !== 'visible'}
-                    onClick={() => onUpdateRule({
-                      hidden_column_ids: hidden
-                        ? (rule?.hidden_column_ids || []).filter(id => id !== column.id)
-                        : [...(rule?.hidden_column_ids || []), column.id],
-                    })}
-                    className={cn(
-                      'flex items-center justify-between rounded-lg border bg-manus/30 p-3 text-left disabled:opacity-45',
-                      column.is_sensitive
-                        ? 'border-rose-500/35'
-                        : 'border-manus-border',
-                    )}
-                  >
-                    <span className="min-w-0"><b className="block truncate text-sm">{column.business_name}</b><code className="text-[11px] text-manus-muted">{column.physical_name}</code></span>
-                    <span className="ml-3 flex shrink-0 items-center gap-2">
-                      {column.is_sensitive && (
-                        <span className={cn(
-                          'rounded-full px-1.5 py-0.5 text-[10px] font-medium',
-                          hidden
-                            ? 'bg-rose-500/10 text-rose-700 dark:text-rose-300'
-                            : 'bg-rose-500/18 text-rose-800 dark:text-rose-200',
-                        )}>
-                          {hidden ? '敏感字段' : '敏感字段 · 已开放'}
-                        </span>
-                      )}
-                      {draftMode && isLowEvidenceConfidence(fieldCandidate?.confidence) && (
-                        <span className="rounded-full bg-amber-500/14 px-1.5 py-0.5 text-[10px] text-amber-700 dark:text-amber-300">
-                          低置信度
-                        </span>
-                      )}
-                      {followsHiddenTable && (
-                        <span className="text-[10px] text-manus-muted">随表不可见</span>
-                      )}
-                      {hidden ? <EyeOff className="h-4 w-4 text-red-300" /> : <Eye className="h-4 w-4 text-emerald-300" />}
-                    </span>
-                  </button>
-                )
-              })}
+              <div className={cn('text-xs text-manus-muted', draftMode && currentCandidate ? 'mt-4' : '')}>授权判断</div>
+              <div className="mt-1 text-sm font-medium">{currentReviewReason}</div>
+              {draftMode && currentCandidate && (
+                <p className="mt-2 text-xs leading-5 text-manus-muted">{currentCandidate.reason || '未提供额外依据说明'}</p>
+              )}
             </div>
 
-            {metrics.length > 0 && <>
-              <h4 className="mb-3 mt-6 text-sm font-medium">指标可见性</h4>
-              <div className="grid gap-2 sm:grid-cols-2">
-                {metrics.map(metric => {
-                  const hidden = rule?.hidden_metric_ids.includes(metric.id)
-                  return (
-                    <button key={metric.id} disabled={!canManage || rule?.decision !== 'visible'} onClick={() => onUpdateRule({
-                      hidden_metric_ids: hidden
-                        ? (rule?.hidden_metric_ids || []).filter(id => id !== metric.id)
-                        : [...(rule?.hidden_metric_ids || []), metric.id],
-                    })} className="flex items-center justify-between rounded-lg border border-manus-border bg-manus/30 p-3 text-left disabled:opacity-45">
-                      <span className="text-sm font-medium">{metric.business_name}</span>
-                      {hidden ? <EyeOff className="h-4 w-4 text-red-300" /> : <Eye className="h-4 w-4 text-emerald-300" />}
-                    </button>
-                  )
-                })}
+            <div className={cn(
+              'mt-3 rounded-xl border px-3 py-3 text-xs',
+              currentTableIsHighRisk || currentTableIsSensitive
+                ? 'border-amber-500/30 bg-amber-500/7'
+                : 'border-manus-border bg-manus-tertiary',
+            )}>
+              <div className="flex items-center gap-2 font-medium">
+                <ShieldCheck className={cn(
+                  'h-4 w-4',
+                  currentTableIsHighRisk || currentTableIsSensitive ? 'text-amber-600' : 'text-manus-muted',
+                )} />
+                风险：{currentTableIsSensitive ? '敏感' : currentTableIsHighRisk ? '高' : '一般'}
               </div>
-            </>}
+              <p className="mt-1.5 leading-5 text-manus-muted">
+                {currentTableIsSensitive
+                  ? '包含敏感字段，授权错误可能扩大数据暴露范围。'
+                  : currentTableIsHighRisk
+                    ? '核心业务数据，授权错误影响较大。'
+                    : '未发现需要单独提示的高风险特征。'}
+              </p>
+            </div>
+            <div className="mt-4 rounded-xl border border-manus-border bg-manus-elevated p-4 text-xs leading-5 text-manus-muted">
+              <div className="mb-1 font-medium text-manus-text">配置提示</div>
+              先确定整表访问，再限制行范围与字段。明确拒绝始终优先于其他授权。
+            </div>
+            </aside>
+
+            <section className="min-h-0 overflow-y-auto p-5 lg:p-6">
+            <div className="rounded-xl border border-manus-border bg-manus-elevated p-4">
+              <div className="grid gap-4 xl:grid-cols-[250px_minmax(0,1fr)]">
+              <div>
+                <div className="mb-2 text-xs font-medium text-manus-muted">访问决定</div>
+                <DecisionSelector
+                  value={target.target_type === 'baseline'
+                    ? rule?.decision || displayedRule?.decision || 'hidden'
+                    : rule?.decision || 'follow'}
+                  allowFollow={target.target_type !== 'baseline'}
+                  disabled={!canManage}
+                  onChange={decision => {
+                    if (decision === 'follow') onRestoreInherited()
+                    else onUpdateRule({ decision })
+                  }}
+                />
+                {dirty && (
+                  <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
+                    当前调整尚未生效，请点击“保存修改”。
+                  </p>
+                )}
+              </div>
+
+              {displayedRule?.decision === 'visible' && (
+                <RowScopeEditor
+                  compact
+                  value={displayedRule.row_scope}
+                  target={target}
+                  organizations={organizations}
+                  columns={columns}
+                  canManageWorkspace={canManageWorkspace}
+                  disabled={!canManage || !rule}
+                  onChange={row_scope => onUpdateRule({ row_scope })}
+                />
+              )}
+              </div>
+
+              <details
+                open={fieldDetailsOpen}
+                onToggle={event => setFieldDetailsOpen(event.currentTarget.open)}
+                className="group mt-4 border-t border-manus-border pt-4"
+              >
+                <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-xs">
+                  <span className="font-medium text-manus-text">可见字段</span>
+                  <span className="flex items-center gap-1 text-manus-muted">
+                    {displayedRule?.decision === 'visible'
+                      ? columns.length - (displayedRule.hidden_column_ids || []).length
+                      : 0}/{columns.length}
+                    <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
+                  </span>
+                </summary>
+                <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                  {columns.map(column => {
+                    const fieldCandidate = currentCandidate?.field_suggestions?.find(
+                      item => item.column_id === column.id,
+                    )
+                    const followsHiddenTable = displayedRule?.decision !== 'visible'
+                    const hidden = followsHiddenTable || (displayedRule?.hidden_column_ids || []).includes(column.id)
+                    return (
+                      <button
+                        key={column.id}
+                        type="button"
+                        disabled={!canManage || !rule || rule.decision !== 'visible'}
+                        onClick={() => onUpdateRule({
+                          hidden_column_ids: hidden
+                            ? (rule?.hidden_column_ids || []).filter(id => id !== column.id)
+                            : [...(rule?.hidden_column_ids || []), column.id],
+                        })}
+                        className={cn(
+                          'flex min-h-12 w-full items-center justify-between rounded-lg border px-3 py-2 text-left transition-colors disabled:opacity-45',
+                          hidden
+                            ? 'border-manus-border bg-manus-tertiary/55 hover:bg-manus-hover'
+                            : 'border-emerald-500/20 bg-emerald-500/5 hover:bg-emerald-500/10',
+                        )}
+                      >
+                        <span className="min-w-0">
+                          <b className="block truncate text-xs font-medium">{column.business_name}</b>
+                          <code className="text-[10px] text-manus-muted">{column.physical_name}</code>
+                        </span>
+                        <span className="ml-2 flex shrink-0 items-center gap-1.5">
+                          {column.is_sensitive && <Pill tone="red">敏感</Pill>}
+                          {isLowEvidenceConfidence(fieldCandidate?.confidence) && <Pill tone="amber">低置信度</Pill>}
+                          {hidden ? <EyeOff className="h-3.5 w-3.5 text-manus-muted" /> : <Eye className="h-3.5 w-3.5 text-emerald-500" />}
+                        </span>
+                      </button>
+                    )
+                  })}
+                </div>
+              </details>
+              {metrics.length > 0 && (
+                <details className="group mt-4 border-t border-manus-border pt-4">
+                  <summary className="flex cursor-pointer list-none items-center justify-between text-xs">
+                    <span className="font-medium">可见指标</span>
+                    <span className="flex items-center gap-1 text-manus-muted">
+                    {displayedRule?.decision === 'visible'
+                        ? metrics.length - (displayedRule.hidden_metric_ids || []).length
+                        : 0}/{metrics.length}
+                      <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />
+                    </span>
+                  </summary>
+                  <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                    {metrics.map(metric => {
+                      const hidden = displayedRule?.decision !== 'visible' || (displayedRule?.hidden_metric_ids || []).includes(metric.id)
+                      return (
+                        <button key={metric.id} type="button" disabled={!canManage || rule?.decision !== 'visible'} onClick={() => onUpdateRule({
+                          hidden_metric_ids: hidden
+                            ? (rule?.hidden_metric_ids || []).filter(id => id !== metric.id)
+                            : [...(rule?.hidden_metric_ids || []), metric.id],
+                        })} className="flex min-h-11 w-full items-center justify-between rounded-lg border border-manus-border bg-manus-tertiary/55 px-3 py-2 text-left text-xs hover:bg-manus-hover disabled:opacity-45">
+                          <span className="font-medium">{metric.business_name}</span>
+                          {hidden ? <EyeOff className="h-3.5 w-3.5 text-manus-muted" /> : <Eye className="h-3.5 w-3.5 text-emerald-500" />}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </details>
+              )}
+            </div>
+
+            {canManage && (
+              (draftMode && Boolean(confirmation?.tablePendingItems))
+              || dirty
+              || confirmBusy
+              || similarSuggestionLoading
+            ) && (
+              <Button
+                className="sticky bottom-0 mt-4 w-full bg-emerald-500 text-white shadow-[0_-8px_24px_rgba(0,0,0,0.08)] hover:bg-emerald-600"
+                onClick={() => void saveTableDetail()}
+                disabled={!canManage || (draftMode && !canManageWorkspace) || confirmBusy || similarSuggestionLoading}
+              >
+                {(confirmBusy || similarSuggestionLoading)
+                  ? <Loader2 className="h-4 w-4 animate-spin" />
+                  : <Check className="h-4 w-4" />}
+                {similarSuggestionLoading
+                  ? '正在查找相似修改…'
+                  : confirmBusy
+                    ? '保存中'
+                    : draftMode && (confirmation?.tablePendingItems || 0) > 0
+                      ? '确认并立即生效'
+                      : '保存修改'}
+              </Button>
+            )}
+            </section>
           </>
         ) : <CenteredState icon={<ShieldCheck />} title="当前数据源没有语义表" />}
-      </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
 
-function DecisionSelector({ value, disabled, onChange }: { value?: 'visible' | 'hidden'; disabled: boolean; onChange: (value?: 'visible' | 'hidden') => void }) {
+function DecisionSelector({ value, allowFollow, disabled, onChange }: {
+  value: 'visible' | 'hidden' | 'follow'
+  allowFollow: boolean
+  disabled: boolean
+  onChange: (value: 'visible' | 'hidden' | 'follow') => void
+}) {
   return (
     <div className="flex rounded-lg border border-manus-border bg-manus-tertiary p-1">
       {([
-        [undefined, '跟随'],
         ['visible', '可见'],
         ['hidden', '不可见'],
+        ...(allowFollow ? [['follow', '跟随'] as const] : []),
       ] as const).map(([id, label]) => (
         <button key={label} disabled={disabled} onClick={() => onChange(id)} className={cn(
           'rounded-md px-3 py-1.5 text-sm transition-colors disabled:opacity-50',
-          value === id && (id === 'visible' ? 'bg-emerald-500/18 text-emerald-300' : id === 'hidden' ? 'bg-red-500/18 text-red-300' : 'bg-manus-secondary'),
+          value === id && (id === 'visible'
+            ? 'bg-emerald-500/18 text-emerald-300'
+            : id === 'hidden'
+              ? 'bg-red-500/18 text-red-300'
+              : 'bg-manus-secondary text-manus-text'),
         )}>{label}</button>
       ))}
     </div>
   )
 }
 
-function RowScopeEditor({ value, target, organizations, columns, canManageWorkspace, disabled, onChange }: {
+function RowScopeEditor({ value, target, organizations, columns, canManageWorkspace, compact = false, disabled, onChange }: {
   value?: SemanticAccessRowScope
   target: SemanticAccessTargetSummary
   organizations: OrgUnit[]
   columns: SemanticColumn[]
   canManageWorkspace: boolean
+  compact?: boolean
   disabled: boolean
   onChange: (scope: SemanticAccessRowScope) => void
 }) {
@@ -2244,9 +2664,13 @@ function RowScopeEditor({ value, target, organizations, columns, canManageWorksp
   const customOrgIds = scope.type === 'custom_org' ? scope.org_unit_ids : []
 
   return (
-    <div className="mt-5 rounded-xl border border-manus-border bg-manus/25 p-4">
+    <div className={cn(
+      compact
+        ? 'min-w-0'
+        : 'mt-5 rounded-xl border border-manus-border bg-manus/25 p-4',
+    )}>
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div><h4 className="text-sm font-medium">行数据范围</h4><p className="mt-1 text-xs text-manus-muted">授权对象与可查看的数据组织范围相互独立。</p></div>
+        <div><h4 className={cn('font-medium', compact ? 'text-xs' : 'text-sm')}>行数据范围</h4>{!compact && <p className="mt-1 text-xs text-manus-muted">授权对象与可查看的数据组织范围相互独立。</p>}</div>
         <NativeSelect value={scope.type} disabled={disabled} onChange={type => {
           if (type === 'custom_org') onChange({ type: 'custom_org', org_unit_ids: [], include_descendants: false })
           else if (type === 'custom') onChange({ type: 'custom', condition: custom })
@@ -2294,7 +2718,7 @@ function MappingEditor({ table, columns, mapping, canEdit, busy, onChange, onSav
     <div className="mt-3 space-y-3 rounded-lg border border-manus-border bg-manus-tertiary p-3">
       <div><b className="text-sm">{table.business_name}</b><p className="text-xs text-manus-muted">组织和本人范围保存前必须映射到真实字段。</p></div>
       <Field label="组织归属字段"><NativeSelect value={mapping.org_column_id == null ? '' : String(mapping.org_column_id)} disabled={!canEdit} onChange={value => onChange({ ...mapping, org_column_id: value ? Number(value) : null })} ariaLabel="组织归属字段"><option value="">未配置</option>{columns.map(column => <option key={column.id} value={column.id}>{column.business_name}</option>)}</NativeSelect></Field>
-      <Field label="组织字段取值"><NativeSelect value={mapping.org_value_kind} disabled={!canEdit} onChange={value => onChange({ ...mapping, org_value_kind: value as 'id' | 'code' })} ariaLabel="组织字段取值"><option value="id">部门 ID</option><option value="code">部门编码</option></NativeSelect></Field>
+      <Field label="组织字段取值"><NativeSelect value={mapping.org_value_kind} disabled={!canEdit} onChange={value => onChange({ ...mapping, org_value_kind: value as 'id' | 'code' | 'external' })} ariaLabel="组织字段取值"><option value="id">部门 ID</option><option value="code">部门编码</option><option value="external" disabled>外部组织值映射（首次配置审核维护）</option></NativeSelect></Field>
       <Field label="人员归属字段"><NativeSelect value={mapping.user_column_id == null ? '' : String(mapping.user_column_id)} disabled={!canEdit} onChange={value => onChange({ ...mapping, user_column_id: value ? Number(value) : null })} ariaLabel="人员归属字段"><option value="">未配置</option>{columns.map(column => <option key={column.id} value={column.id}>{column.business_name}</option>)}</NativeSelect></Field>
       <Field label="人员字段取值"><NativeSelect value={mapping.user_value_kind} disabled={!canEdit} onChange={value => onChange({ ...mapping, user_value_kind: value as 'id' | 'username' })} ariaLabel="人员字段取值"><option value="id">账号 ID</option><option value="username">登录名</option></NativeSelect></Field>
       {canEdit ? <Button size="sm" variant="outline" className="w-full" onClick={onSave} disabled={busy}>{busy && <Loader2 className="h-4 w-4 animate-spin" />}保存归属映射</Button> : <p className="text-xs text-amber-300">需要工作区级问数权限管理能力。</p>}
@@ -3092,14 +3516,6 @@ function ProgressCard({ title, reviewed, total }: { title: string; reviewed: num
   return <div className="rounded-xl border border-manus-border bg-manus-tertiary p-4"><div className="text-sm font-medium">{title}</div><div className={cn('mt-2 text-2xl font-semibold', complete ? 'text-emerald-300' : 'text-amber-300')}>{reviewed}/{total}</div></div>
 }
 
-function SummaryCountCard({ title, value, complete }: {
-  title: string
-  value: number
-  complete: boolean
-}) {
-  return <div className="rounded-xl border border-manus-border bg-manus-tertiary p-4"><div className="text-sm font-medium">{title}</div><div className={cn('mt-2 text-2xl font-semibold', complete ? 'text-emerald-300' : 'text-amber-300')}>{value}</div></div>
-}
-
 function evidenceBlockerLabel(code: string) {
   return {
     business_context_missing: '企业业务背景未填写',
@@ -3156,7 +3572,7 @@ function TargetStatus({ target, configured, draft = false }: {
   if (draft) return <Pill tone="amber">草稿</Pill>
   if (target.has_explicit_deny) return <Pill tone="red">存在明确拒绝</Pill>
   if (configured) return <Pill tone="green">已配置</Pill>
-  return <Pill tone="neutral">未配置 · 跟随</Pill>
+  return <Pill tone="neutral">继承上级</Pill>
 }
 
 function Pill({ children, tone }: { children: ReactNode; tone: 'green' | 'red' | 'blue' | 'amber' | 'neutral' }) {

@@ -3,6 +3,7 @@ import { useToast } from '@/components/ui/toast'
 import { extendConfigService } from '@/services/extendConfigService'
 import type {
     SemanticAccessOptions,
+    SemanticBusinessSuggestion,
     SemanticColumn,
     SemanticEvalCase,
     SemanticEvalRun,
@@ -10,6 +11,7 @@ import type {
     SemanticGovernanceEvidenceFact,
     SemanticGovernancePolicy,
     SemanticGovernanceRun,
+    SemanticModelCounts,
     SemanticMetricForm,
     SemanticModelsPayload,
     SemanticPreviewErrorDetail,
@@ -30,11 +32,27 @@ const EMPTY_PAYLOAD: SemanticModelsPayload = {
     relationships: [],
     business_suggestions: [],
     recent_runs: [],
+    matching_diagnostics: [],
 }
 
 const EMPTY_ACCESS_OPTIONS: SemanticAccessOptions = {
     roles: [],
     users: [],
+}
+
+const EMPTY_MODEL_COUNTS: SemanticModelCounts = {
+    tables: 0,
+    queryable_tables: 0,
+    columns: 0,
+    queryable_columns: 0,
+    metrics: 0,
+    queryable_metrics: 0,
+    relationships: 0,
+    queryable_relationships: 0,
+    stale_assets: 0,
+    orphaned_assets: 0,
+    recent_runs: 0,
+    recent_success_runs: 0,
 }
 
 const ACTIVE_GOVERNANCE_RUN_STATUSES = ['pending', 'running', 'cancel_requested'] as const
@@ -85,6 +103,9 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
     const accessOnly = Boolean(options.accessOnly)
     const { toast } = useToast()
     const [data, setData] = useState<SemanticModelsPayload>(EMPTY_PAYLOAD)
+    const [tableBusinessSuggestions, setTableBusinessSuggestions] = useState<SemanticBusinessSuggestion[]>([])
+    const [modelCounts, setModelCounts] = useState<SemanticModelCounts>(EMPTY_MODEL_COUNTS)
+    const [hasLoadedModels, setHasLoadedModels] = useState(false)
     const [accessOptions, setAccessOptions] = useState<SemanticAccessOptions>(EMPTY_ACCESS_OPTIONS)
     const [isLoading, setIsLoading] = useState(true)
     const [isSaving, setIsSaving] = useState(false)
@@ -96,7 +117,6 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
     const [evalRuns, setEvalRuns] = useState<SemanticEvalRun[]>([])
     const [activeTableId, setActiveTableId] = useState<number | null>(null)
     const [readiness, setReadiness] = useState<SemanticReadiness | null>(null)
-    const [scanRuns, setScanRuns] = useState<SemanticScanRun[]>([])
     const [scanPreview, setScanPreview] = useState<SemanticScanRun | null>(null)
     const [questionReadiness, setQuestionReadiness] = useState<SemanticQuestionReadiness | null>(null)
     const [governanceRuns, setGovernanceRuns] = useState<SemanticGovernanceRun[]>([])
@@ -105,6 +125,7 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
     const [governanceEvidence, setGovernanceEvidence] = useState<SemanticGovernanceEvidenceFact[]>([])
     const activeGovernanceRunRef = useRef<number | null>(null)
     const notifiedGovernanceRunIdsRef = useRef<Set<number>>(new Set())
+    const tableSuggestionRequestRef = useRef(0)
 
     const load = useCallback(async (options?: { showLoading?: boolean }) => {
         const showLoading = options?.showLoading ?? true
@@ -113,7 +134,11 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
             const payload = accessOnly
                 ? await extendConfigService.getSemanticAccessAssets()
                 : await extendConfigService.getSemanticModels()
-            setData(payload)
+            setData({
+                ...payload,
+                matching_diagnostics: payload.matching_diagnostics || [],
+            })
+            setHasLoadedModels(true)
             setActiveTableId(current =>
                 payload.tables.some(table => table.id === current)
                     ? current
@@ -130,9 +155,62 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
         }
     }, [accessOnly, toast])
 
+    const loadOverview = useCallback(async () => {
+        setIsLoading(true)
+        try {
+            const overview = await extendConfigService.getSemanticModelOverview()
+            setModelCounts(overview.counts)
+            setData(current => ({ ...current, datasource: overview.datasource }))
+        } catch (error) {
+            toast({
+                type: 'error',
+                title: '语义模型概览加载失败',
+                description: error instanceof Error ? error.message : '请稍后重试',
+            })
+        } finally {
+            setIsLoading(false)
+        }
+    }, [toast])
+
     useEffect(() => {
-        load()
-    }, [load])
+        loadOverview()
+    }, [loadOverview])
+
+    const loadTableBusinessSuggestions = useCallback(async (tableId: number) => {
+        const requestToken = ++tableSuggestionRequestRef.current
+        try {
+            const suggestions = await extendConfigService.getTableBusinessSuggestions(tableId)
+            if (requestToken === tableSuggestionRequestRef.current) {
+                setTableBusinessSuggestions(suggestions)
+            }
+        } catch (error) {
+            if (requestToken === tableSuggestionRequestRef.current) {
+                setTableBusinessSuggestions([])
+            }
+            toast({
+                type: 'error',
+                title: '当前表语义建议加载失败',
+                description: error instanceof Error ? error.message : '请稍后重试',
+            })
+        }
+    }, [toast])
+
+    useEffect(() => {
+        if (accessOnly || !activeTableId) {
+            tableSuggestionRequestRef.current += 1
+            setTableBusinessSuggestions([])
+            return
+        }
+        setTableBusinessSuggestions([])
+        void loadTableBusinessSuggestions(activeTableId)
+    }, [accessOnly, activeTableId, loadTableBusinessSuggestions])
+
+    const refreshSemanticData = useCallback(async (tableId?: number | null) => {
+        await Promise.all([
+            load({ showLoading: false }),
+            tableId ? loadTableBusinessSuggestions(tableId) : Promise.resolve(),
+        ])
+    }, [load, loadTableBusinessSuggestions])
 
     const loadAccessOptions = useCallback(async () => {
         try {
@@ -176,15 +254,13 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
 
     const loadTrustFoundation = useCallback(async () => {
         try {
-            const [nextReadiness, nextScans, nextGovernanceRuns, nextCandidates, nextPolicy] = await Promise.all([
+            const [nextReadiness, nextGovernanceRuns, nextCandidates, nextPolicy] = await Promise.all([
                 extendConfigService.getSemanticReadiness(),
-                extendConfigService.listSemanticScans(),
                 extendConfigService.listSemanticGovernanceRuns(),
                 extendConfigService.listSemanticGovernanceCandidates({ min_score: 0.65 }),
                 extendConfigService.getSemanticGovernancePolicy(),
             ])
             setReadiness(nextReadiness)
-            setScanRuns(nextScans)
             setGovernanceRuns(nextGovernanceRuns)
             setGovernanceCandidates(nextCandidates)
             setGovernancePolicy(nextPolicy)
@@ -365,7 +441,7 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
         setIsSaving(true)
         try {
             await extendConfigService.updateSemanticModel(modelType, id, patch)
-            await load({ showLoading: false })
+            await refreshSemanticData(activeTableId)
             toast({ type: 'success', title: '语义模型已更新' })
             return true
         } catch (error) {
@@ -378,7 +454,7 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
         } finally {
             setIsSaving(false)
         }
-    }, [load, toast])
+    }, [activeTableId, refreshSemanticData, toast])
 
     const scan = useCallback(async () => {
         setIsSaving(true)
@@ -559,7 +635,7 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
                 force,
                 use_llm: true,
             })
-            await load({ showLoading: false })
+            await refreshSemanticData(tableId || activeTableId)
             toast({
                 type: 'success',
                 title: '语义建议已生成',
@@ -576,13 +652,13 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
         } finally {
             setIsSaving(false)
         }
-    }, [load, toast])
+    }, [activeTableId, refreshSemanticData, toast])
 
     const acceptTableBusinessSuggestions = useCallback(async (tableId: number) => {
         setIsSaving(true)
         try {
             const result = await extendConfigService.acceptTableBusinessSuggestions(tableId)
-            await load({ showLoading: false })
+            await refreshSemanticData(tableId)
             toast({ type: 'success', title: '已接受本表语义建议', description: `已应用 ${result.accepted_count || 0} 条建议` })
             return true
         } catch (error) {
@@ -591,7 +667,7 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
         } finally {
             setIsSaving(false)
         }
-    }, [load, toast])
+    }, [refreshSemanticData, toast])
 
     const generateMetricSuggestions = useCallback(async () => {
         setIsSaving(true)
@@ -627,7 +703,7 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
         setIsSaving(true)
         try {
             await extendConfigService.updateBusinessSuggestion(id, patch)
-            await load({ showLoading: false })
+            await refreshSemanticData(activeTableId)
             toast({ type: 'success', title: '语义建议已更新' })
             return true
         } catch (error) {
@@ -640,13 +716,13 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
         } finally {
             setIsSaving(false)
         }
-    }, [load, toast])
+    }, [activeTableId, refreshSemanticData, toast])
 
     const acceptBusinessSuggestion = useCallback(async (id: number) => {
         setIsSaving(true)
         try {
             await extendConfigService.acceptBusinessSuggestion(id)
-            await load({ showLoading: false })
+            await refreshSemanticData(activeTableId)
             toast({ type: 'success', title: '语义建议已接受' })
         } catch (error) {
             toast({
@@ -657,7 +733,7 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
         } finally {
             setIsSaving(false)
         }
-    }, [load, toast])
+    }, [activeTableId, refreshSemanticData, toast])
 
     const confirmBusinessSuggestion = useCallback(async (id: number, patch?: Record<string, unknown>) => {
         setIsSaving(true)
@@ -666,7 +742,7 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
                 await extendConfigService.updateBusinessSuggestion(id, patch)
             }
             await extendConfigService.acceptBusinessSuggestion(id)
-            await load({ showLoading: false })
+            await refreshSemanticData(activeTableId)
             toast({ type: 'success', title: '语义建议已确认' })
             return true
         } catch (error) {
@@ -679,14 +755,14 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
         } finally {
             setIsSaving(false)
         }
-    }, [load, toast])
+    }, [activeTableId, refreshSemanticData, toast])
 
     const batchAcceptBusinessSuggestions = useCallback(async (ids: number[]) => {
         if (!ids.length) return
         setIsSaving(true)
         try {
             await extendConfigService.batchAcceptBusinessSuggestions(ids)
-            await load({ showLoading: false })
+            await refreshSemanticData(activeTableId)
             toast({ type: 'success', title: `已接受 ${ids.length} 条语义建议` })
         } catch (error) {
             toast({
@@ -697,13 +773,13 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
         } finally {
             setIsSaving(false)
         }
-    }, [load, toast])
+    }, [activeTableId, refreshSemanticData, toast])
 
     const rejectBusinessSuggestion = useCallback(async (id: number) => {
         setIsSaving(true)
         try {
             await extendConfigService.rejectBusinessSuggestion(id)
-            await load({ showLoading: false })
+            await refreshSemanticData(activeTableId)
             toast({ type: 'success', title: '语义建议已忽略' })
         } catch (error) {
             toast({
@@ -714,7 +790,7 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
         } finally {
             setIsSaving(false)
         }
-    }, [load, toast])
+    }, [activeTableId, refreshSemanticData, toast])
 
     const confirmTable = useCallback((table: SemanticTable) => {
         updateModel('tables', table.id, { status: 'confirmed', is_queryable: true })
@@ -726,6 +802,9 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
 
     return {
         data,
+        tableBusinessSuggestions,
+        modelCounts,
+        hasLoadedModels,
         accessOptions,
         isLoading,
         isSaving,
@@ -740,7 +819,6 @@ export function useSemanticModels(options: { accessOnly?: boolean } = {}) {
         setActiveTableId,
         columnsByTable,
         readiness,
-        scanRuns,
         scanPreview,
         setScanPreview,
         questionReadiness,

@@ -15,9 +15,11 @@ import os
 import base64
 
 from app.core.db.database import Base, get_async_db_manager
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.pool import AsyncAdaptedQueuePool
 import threading
+
+from app.core.db.mysql_connection_policy import create_async_mysql_engine
 
 logger = logging.getLogger(__name__)
 
@@ -303,8 +305,16 @@ async def save_workspace_db_config_async(
             select(UserDBConfigModel).where(UserDBConfigModel.workspace_id == workspace_id)
         )
         existing = result.scalar_one_or_none()
-        
+        if existing is None:
+            # Legacy production schemas keep user_id NOT NULL and unique. Reuse
+            # the configuring admin's row so one record serves both lookups.
+            result = await session.execute(
+                select(UserDBConfigModel).where(UserDBConfigModel.user_id == configured_by)
+            )
+            existing = result.scalar_one_or_none()
+
         if existing:
+            existing.workspace_id = workspace_id
             # 更新现有记录
             existing.host = config.host
             existing.port = config.port
@@ -482,7 +492,7 @@ def get_workspace_engine(workspace_id: str, config: UserDBConfig) -> AsyncEngine
             "mysql+pymysql://", "mysql+aiomysql://"
         )
         
-        engine = create_async_engine(
+        engine = create_async_mysql_engine(
             connection_url,
             poolclass=AsyncAdaptedQueuePool,
             pool_size=5,               # 连接池大小

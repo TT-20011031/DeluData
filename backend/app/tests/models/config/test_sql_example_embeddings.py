@@ -63,6 +63,7 @@ async def test_add_sql_example_embedding_uses_explicit_embeddings(monkeypatch):
         question="统计近30天订单数",
         sql="select count(*) from orders",
         workspace_id="ws-1",
+        owner_id="tester",
         description="按创建时间过滤",
         tables="orders",
         is_active=False,
@@ -77,6 +78,7 @@ async def test_add_sql_example_embedding_uses_explicit_embeddings(monkeypatch):
     assert payload["documents"] == ["统计近30天订单数\n按创建时间过滤"]
     assert payload["embeddings"] == [[1.0, 1.0, 1.0]]
     assert payload["metadatas"][0]["workspace_id"] == "ws-1"
+    assert payload["metadatas"][0]["owner_id"] == "tester"
     assert payload["metadatas"][0]["is_active"] is False
 
 
@@ -100,9 +102,22 @@ async def test_search_sql_examples_by_similarity_uses_query_embeddings(monkeypat
     monkeypatch.setattr(module, "get_sql_examples_collection", lambda: collection)
     monkeypatch.setattr(module, "get_async_embedding", lambda: embedding_client)
 
-    async def fake_load(example_ids, workspace_id, *, active_only):
+    async def fake_exact(question, workspace_id, owner_id):
+        assert owner_id == "tester"
+        return None
+
+    monkeypatch.setattr(module, "_find_exact_sql_example", fake_exact)
+
+    async def fake_parameterized(question, workspace_id, owner_id):
+        assert owner_id == "tester"
+        return None
+
+    monkeypatch.setattr(module, "_find_parameterized_sql_example", fake_parameterized)
+
+    async def fake_load(example_ids, workspace_id, owner_id, *, active_only):
         assert example_ids == [1]
         assert workspace_id == "ws-1"
+        assert owner_id == "tester"
         assert active_only is True
         return {1: example}
 
@@ -111,6 +126,7 @@ async def test_search_sql_examples_by_similarity_uses_query_embeddings(monkeypat
     matches = await module.search_sql_examples_by_similarity(
         question="本月销售额是多少",
         workspace_id="ws-1",
+        owner_id="tester",
         threshold=0.5,
         n_results=2,
     )
@@ -124,7 +140,9 @@ async def test_search_sql_examples_by_similarity_uses_query_embeddings(monkeypat
     assert query_payload["where"] == {
         "$and": [
             {"workspace_id": {"$eq": "ws-1"}},
+            {"owner_id": {"$eq": "tester"}},
             {"is_active": {"$eq": True}},
+            {"validation_status": {"$eq": "valid"}},
         ]
     }
     assert matches == [(example, 0.9)]

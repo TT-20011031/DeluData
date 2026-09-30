@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import re
 from datetime import datetime
 from typing import Any
 
@@ -10,6 +13,7 @@ from sqlalchemy import func, select
 
 from app.config import get_settings
 from app.core.db.database import get_async_db_manager
+from app.core.db.read_only_executor import ReadOnlyExecutor
 from app.core.llm.async_llm import get_async_llm
 from app.models.auth.authorization import AssignmentModel, PositionModel
 from app.models.auth.organization import DepartmentModel
@@ -24,6 +28,7 @@ from app.models.config.permission_evidence import (
     SemanticAccessEvidenceSetModel,
     SemanticPermissionEvidenceRunModel,
 )
+from app.models.config.db_config import get_workspace_db_config_async
 from app.models.config.semantic import (
     SemanticAccessBootstrapRunModel,
     SemanticAccessBootstrapTargetModel,
@@ -67,6 +72,193 @@ ROW_SCOPE_TYPES = {
     "all", "self", "target_org", "target_org_tree", "primary_assignment",
     "all_assignments", "custom_org", "custom",
 }
+
+logger = logging.getLogger(__name__)
+ROW_OWNERSHIP_VERSION = 2
+ROW_OWNERSHIP_STRONG_ENGLISH = {
+    "department", "dept", "organization", "org", "orgunit",
+}
+ROW_OWNERSHIP_EXPANDED_ENGLISH = {
+    "division", "businessunit", "bu", "branch", "office", "center",
+    "team", "group", "unit", "store", "outlet", "site", "section",
+    "workshop",
+}
+ROW_OWNERSHIP_MODIFIER_ENGLISH = {
+    "belong", "belongs", "belonging", "owner", "owning", "responsible",
+    "accountable", "managed", "assigned",
+}
+ROW_OWNERSHIP_IDENTIFIER_ENGLISH = {
+    "id", "code", "no", "key", "name", "identifier",
+}
+ROW_OWNERSHIP_STRONG_CHINESE = ("部门", "组织", "机构")
+ROW_OWNERSHIP_EXPANDED_CHINESE = (
+    "事业部", "分部", "分支", "办事处", "中心", "团队", "班组", "门店",
+    "网点", "科室", "处室", "车间", "项目部",
+)
+ROW_OWNERSHIP_MODIFIER_CHINESE = (
+    "所属", "归属", "责任", "负责", "管理", "管辖", "承办",
+)
+ROW_OWNERSHIP_IDENTIFIER_CHINESE = ("编号", "编码", "标识", "名称")
+ROW_OWNERSHIP_HARD_EXCLUDE_ENGLISH = {
+    "createdby", "creator", "updatedby", "updater", "owneruser", "userid",
+    "user", "account", "employee", "person", "manager", "staff", "member",
+    "operator", "assignee", "username", "customer", "client", "supplier",
+    "vendor", "company", "legalentity", "region", "area", "country", "city",
+    "warehouse", "product", "channel", "measurement", "measure", "uom",
+    "location", "address",
+}
+ROW_OWNERSHIP_HARD_EXCLUDE_CHINESE = (
+    "创建人", "更新人", "负责人", "责任人", "经办人", "管理员", "人员", "用户",
+    "员工", "客户", "供应商",
+    "公司", "法人", "区域", "国家", "城市", "仓库", "产品", "渠道", "计量",
+    "地点", "地址",
+)
+
+
+def _quote_identifier(value: str) -> str:
+    return "`" + str(value).replace("`", "``") + "`"
+
+
+def _ownership_source_type(data_type: Any) -> str | None:
+    value = str(data_type or "").lower()
+    if any(item in value for item in ("int", "serial")):
+        return "integer"
+    if any(item in value for item in ("char", "text", "string", "enum", "set")):
+        return "string"
+    return None
+
+
+def _ownership_english_tokens(value: Any) -> set[str]:
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(value or ""))
+    tokens = re.findall(r"[a-zA-Z0-9]+", text.casefold())
+    result = set(tokens)
+    result.update(
+        "".join(tokens[index:index + 2])
+        for index in range(max(len(tokens) - 1, 0))
+    )
+    return result
+
+
+def _ownership_text_values(column: Any, names: tuple[str, ...]) -> list[str]:
+    values: list[str] = []
+    for name in names:
+        value = getattr(column, name, None)
+        if isinstance(value, (list, tuple, set)):
+            values.extend(str(item or "") for item in value)
+        else:
+            values.append(str(value or ""))
+    return values
+
+
+def _ownership_candidate_metadata(column: Any) -> dict[str, Any] | None:
+    """Score direct organization ownership metadata without inspecting row values."""
+    if not _ownership_source_type(getattr(column, "data_type", None)):
+        return None
+
+    structural_values = _ownership_text_values(
+        column, ("physical_name", "business_name", "synonyms"),
+    )
+    descriptive_values = _ownership_text_values(
+        column, ("description", "physical_comment"),
+    )
+    all_values = structural_values + descriptive_values
+    structural_text = " ".join(structural_values)
+    descriptive_text = " ".join(descriptive_values)
+    all_text = " ".join(all_values)
+    structural_tokens = _ownership_english_tokens(structural_text)
+    descriptive_tokens = _ownership_english_tokens(descriptive_text)
+    all_tokens = structural_tokens | descriptive_tokens
+    compact_tokens = {token.replace("_", "") for token in all_tokens}
+
+    hard_excludes = sorted(
+        token for token in ROW_OWNERSHIP_HARD_EXCLUDE_ENGLISH
+        if token in compact_tokens
+    )
+    hard_excludes.extend(
+        value for value in ROW_OWNERSHIP_HARD_EXCLUDE_CHINESE if value in all_text
+    )
+    if hard_excludes:
+        return None
+
+    strong_structural = sorted(
+        ROW_OWNERSHIP_STRONG_ENGLISH & structural_tokens
+    ) + [value for value in ROW_OWNERSHIP_STRONG_CHINESE if value in structural_text]
+    expanded_structural = sorted(
+        ROW_OWNERSHIP_EXPANDED_ENGLISH & structural_tokens
+    ) + [value for value in ROW_OWNERSHIP_EXPANDED_CHINESE if value in structural_text]
+    strong_descriptive = sorted(
+        ROW_OWNERSHIP_STRONG_ENGLISH & descriptive_tokens
+    ) + [value for value in ROW_OWNERSHIP_STRONG_CHINESE if value in descriptive_text]
+    expanded_descriptive = sorted(
+        ROW_OWNERSHIP_EXPANDED_ENGLISH & descriptive_tokens
+    ) + [value for value in ROW_OWNERSHIP_EXPANDED_CHINESE if value in descriptive_text]
+    modifiers = sorted(
+        ROW_OWNERSHIP_MODIFIER_ENGLISH & all_tokens
+    ) + [value for value in ROW_OWNERSHIP_MODIFIER_CHINESE if value in all_text]
+    structural_modifiers = sorted(
+        ROW_OWNERSHIP_MODIFIER_ENGLISH & structural_tokens
+    ) + [value for value in ROW_OWNERSHIP_MODIFIER_CHINESE if value in structural_text]
+    identifiers = sorted(
+        ROW_OWNERSHIP_IDENTIFIER_ENGLISH & structural_tokens
+    ) + [value for value in ROW_OWNERSHIP_IDENTIFIER_CHINESE if value in structural_text]
+
+    score = 0
+    signals: list[str] = []
+    if strong_structural or strong_descriptive:
+        score += 4
+        signals.append("strong_unit:" + str((strong_structural or strong_descriptive)[0]))
+    elif expanded_structural or expanded_descriptive:
+        score += 3
+        signals.append("expanded_unit:" + str((expanded_structural or expanded_descriptive)[0]))
+    if modifiers:
+        score += 2
+        signals.append("ownership_modifier:" + str(modifiers[0]))
+    if identifiers:
+        score += 1
+        signals.append("identifier:" + str(identifiers[0]))
+
+    if strong_structural:
+        tier = "strong"
+    elif expanded_structural and (modifiers or identifiers):
+        tier = "expanded"
+    elif (
+        (strong_descriptive or expanded_descriptive)
+        and structural_modifiers
+    ):
+        # Description/comment evidence needs an independent structural signal.
+        tier = "expanded"
+    else:
+        return None
+    if score < 4:
+        return None
+    return {
+        "candidate_tier": tier,
+        "metadata_score": score,
+        "matched_signals": signals,
+    }
+
+
+def _ownership_candidate_thresholds(policy: Any, tier: str) -> tuple[float, float]:
+    if tier == "expanded":
+        return (
+            float(getattr(policy, "expanded_candidate_confidence", 0.95)),
+            float(getattr(policy, "expanded_candidate_margin", 0.20)),
+        )
+    return float(policy.candidate_confidence), float(policy.candidate_margin)
+
+
+def _ownership_value_confidence(policy: Any, tier: str) -> float:
+    if tier == "expanded":
+        return float(getattr(policy, "expanded_value_confidence", 0.95))
+    return float(policy.value_confidence)
+
+
+def _normalized_org_value(value: Any) -> str:
+    return re.sub(r"[\s_\-（）()]+", "", str(value or "")).casefold()
+
+
+def _typed_value_key(source_type: str, value: Any) -> tuple[str, str]:
+    return source_type, str(value)
 
 
 class PermissionEvidenceError(Exception):
@@ -488,8 +680,6 @@ class PermissionEvidenceService:
                     binding = org_bindings.get(org_id)
                     if not binding:
                         continue
-                    if org_id != int(department.id) and not binding.include_descendants:
-                        continue
                     applicable.append((
                         "direct" if org_id == int(department.id) else "inherited",
                         str(org_id),
@@ -497,11 +687,20 @@ class PermissionEvidenceService:
                     ))
 
                 for table in tables:
-                    matched = [
+                    org_matched = [
+                        (source, source_target_id, rules[int(table.id)])
+                        for source, source_target_id, rules in reversed(applicable)
+                        if source != "baseline" and int(table.id) in rules
+                    ]
+                    baseline_matched = [
                         (source, source_target_id, rules[int(table.id)])
                         for source, source_target_id, rules in applicable
-                        if int(table.id) in rules
+                        if source == "baseline" and int(table.id) in rules
                     ]
+                    # Department permissions are sparse overrides. The nearest
+                    # configured department wins; baseline is consulted only
+                    # when no department in the chain configures this table.
+                    matched = org_matched[:1] or baseline_matched
                     decision, source, source_target_id, reason = (
                         resolve_matrix_decision(matched)
                     )
@@ -523,8 +722,6 @@ class PermissionEvidenceService:
                         target = draft_orgs.get(org_id)
                         if not target:
                             continue
-                        if org_id != int(department.id) and not target.include_descendants:
-                            continue
                         rule = next((
                             item
                             for item in (target.definition_json or {}).get("tables") or []
@@ -536,6 +733,14 @@ class PermissionEvidenceService:
                                 str(org_id),
                                 rule,
                             ))
+                    draft_org_matched = [
+                        item for item in reversed(draft_applicable)
+                        if item[0] != "baseline"
+                    ]
+                    draft_baseline_matched = [
+                        item for item in draft_applicable if item[0] == "baseline"
+                    ]
+                    draft_applicable = draft_org_matched[:1] or draft_baseline_matched
                     if draft_applicable:
                         (
                             pending_decision,
@@ -842,6 +1047,13 @@ class PermissionEvidenceService:
     async def enqueue_if_ready_in_session(
         self, session, workspace_id: str, datasource_id: int, actor_id: str,
     ) -> bool:
+        if not self.settings.semantic_access_evidence.auto_regenerate_on_semantic_change:
+            logger.info(
+                "semantic access evidence auto-regeneration disabled: workspace=%s datasource=%s",
+                workspace_id,
+                datasource_id,
+            )
+            return False
         current_sets = list((await session.execute(select(SemanticAccessEvidenceSetModel).where(
             SemanticAccessEvidenceSetModel.workspace_id == workspace_id,
             SemanticAccessEvidenceSetModel.datasource_id == datasource_id,
@@ -1349,6 +1561,18 @@ class PermissionEvidenceService:
                     await session.flush()
                     run.evidence_set_id = failed_set.id
             return
+        try:
+            ownership_summary = await self._generate_ownership_candidates(snapshot)
+        except Exception as exc:  # Row inference must never discard table/field evidence.
+            logger.warning("row ownership candidate generation failed: %s", exc, exc_info=True)
+            ownership_summary = {
+                "version": ROW_OWNERSHIP_VERSION,
+                "candidates": [],
+                "skipped": [{
+                    "reason_code": "row_ownership_generation_failed",
+                    "message": str(exc)[:1000],
+                }],
+            }
         async with db.session_scope() as session:
             run = await session.get(SemanticPermissionEvidenceRunModel, run_id)
             current = await self._generation_snapshot(
@@ -1369,10 +1593,11 @@ class PermissionEvidenceService:
             ))).scalar() or 0
             evidence_set = SemanticAccessEvidenceSetModel(
                 workspace_id=run.workspace_id, datasource_id=run.datasource_id,
-                version=int(previous) + 1, model_version=2, status="review_ready",
+                version=int(previous) + 1, model_version=3, status="review_ready",
                 org_profile_fingerprint=current["fingerprints"]["org_profiles"],
                 schema_fingerprint=current["fingerprints"]["schema"],
                 semantic_fingerprint=current["fingerprints"]["semantics"],
+                generation_summary_json={"row_ownership_v2": ownership_summary},
                 generated_at=datetime.now(),
             )
             session.add(evidence_set)
@@ -1437,7 +1662,11 @@ class PermissionEvidenceService:
             run.evidence_set_id = evidence_set.id
             run.status, run.stage, run.progress = "completed", "review_ready", 100
             run.finished_at = datetime.now()
-            run.result_summary_json = {"evidence_set_id": evidence_set.id, "version": evidence_set.version}
+            run.result_summary_json = {
+                "evidence_set_id": evidence_set.id,
+                "version": evidence_set.version,
+                "row_ownership_candidate_count": len(ownership_summary.get("candidates") or []),
+            }
 
     async def _generate_evidence_drafts(self, snapshot: dict[str, Any]):
         """Generate small strict-ID batches and retry only the invalid batch."""
@@ -1503,6 +1732,465 @@ class PermissionEvidenceService:
             else:
                 raise ValueError(f"访问依据批次生成失败: {last_error}")
         return all_results
+
+    async def _generate_ownership_candidates(
+        self, snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Rank direct ownership metadata, then validate the selected value domain."""
+        policy = self.settings.semantic_row_ownership
+        if not policy.enabled:
+            return {
+                "version": ROW_OWNERSHIP_VERSION,
+                "candidates": [],
+                "skipped": [{"reason_code": "disabled"}],
+            }
+
+        columns_by_table: dict[int, list[tuple[Any, dict[str, Any]]]] = {}
+        for column in snapshot["columns"]:
+            metadata = _ownership_candidate_metadata(column)
+            if metadata is None:
+                continue
+            columns_by_table.setdefault(int(column.table_id), []).append((column, metadata))
+
+        candidate_input = []
+        skipped: list[dict[str, Any]] = []
+        metadata_by_column_id: dict[int, dict[str, Any]] = {}
+        candidate_limit = max(1, min(int(getattr(policy, "candidate_limit", 8)), 30))
+        for table in snapshot["tables"]:
+            ranked = sorted(
+                columns_by_table.get(int(table.id), []),
+                key=lambda item: (
+                    -int(item[1]["metadata_score"]),
+                    int(getattr(item[0], "ordinal_position", 0) or 0),
+                    int(item[0].id),
+                ),
+            )
+            eligible = ranked[:candidate_limit]
+            for column, metadata in ranked[candidate_limit:]:
+                skipped.append({
+                    "table_id": int(table.id),
+                    "column_id": int(column.id),
+                    "reason_code": "candidate_shortlist_limit",
+                    **metadata,
+                })
+            if not eligible:
+                skipped.append({
+                    "table_id": int(table.id),
+                    "reason_code": "no_scored_candidate",
+                })
+                continue
+            for column, metadata in eligible:
+                metadata_by_column_id[int(column.id)] = metadata
+            candidate_input.append({
+                "table_id": int(table.id),
+                "physical_name": table.physical_name,
+                "business_name": table.business_name,
+                "description": table.description or "",
+                "columns": [{
+                    "column_id": int(column.id),
+                    "physical_name": column.physical_name,
+                    "business_name": column.business_name,
+                    "description": column.description or "",
+                    "physical_comment": getattr(column, "physical_comment", None) or "",
+                    "synonyms": list(getattr(column, "synonyms", None) or []),
+                    "data_type": column.data_type,
+                    **metadata,
+                } for column, metadata in eligible],
+            })
+        if not candidate_input:
+            return {
+                "version": ROW_OWNERSHIP_VERSION,
+                "candidates": [],
+                "skipped": skipped,
+            }
+
+        selected: list[dict[str, Any]] = []
+        column_by_id = {int(row.id): row for row in snapshot["columns"]}
+        table_by_id = {int(row.id): row for row in snapshot["tables"]}
+        for offset in range(0, len(candidate_input), 20):
+            batch = candidate_input[offset: offset + 20]
+            result = await self.llm.generate_json(
+                [{
+                    "role": "system",
+                    "content": (
+                        "识别表中直接表示数据所属部门或组织的字段。只输出给定 ID。"
+                        "字段的候选层级和命中词只用于召回，不能单独证明它是组织归属字段。"
+                        "门店、中心、团队、分支等字段只有在确实对应 DeluData 内部部门层级时才可选择。"
+                        "不要选择人员、创建人、客户、供应商、公司主体、区域、地点、仓库、产品或渠道字段。"
+                        "不推断关联表、多字段或自定义条件。"
+                        "每张表返回最多两个候选，按置信度降序。"
+                        "输出 JSON: {tables:[{table_id,candidates:[{column_id,confidence,reason}]}]}。"
+                    ),
+                }, {
+                    "role": "user",
+                    "content": json.dumps({"tables": batch}, ensure_ascii=False),
+                }],
+                model=getattr(self.settings.llm, "fast_model", self.settings.llm.model),
+                temperature=0,
+                max_tokens=6000,
+            )
+            rows = result.get("tables") if isinstance(result, dict) else None
+            if not isinstance(rows, list):
+                raise ValueError("行归属候选输出缺少 tables")
+            returned_tables: set[int] = set()
+            batch_by_id = {int(item["table_id"]): item for item in batch}
+            for item in rows:
+                table_id = int(item.get("table_id") or 0)
+                if table_id not in batch_by_id or table_id in returned_tables:
+                    raise ValueError("行归属候选包含非法或重复表 ID")
+                returned_tables.add(table_id)
+                allowed_columns = {
+                    int(column["column_id"])
+                    for column in batch_by_id[table_id]["columns"]
+                }
+                candidates = item.get("candidates") or []
+                if not isinstance(candidates, list):
+                    raise ValueError("行归属候选格式无效")
+                normalized = []
+                seen_columns: set[int] = set()
+                for candidate in candidates[:2]:
+                    column_id = int(candidate.get("column_id") or 0)
+                    if column_id not in allowed_columns or column_id in seen_columns:
+                        raise ValueError("行归属候选包含非法或重复字段 ID")
+                    seen_columns.add(column_id)
+                    normalized.append({
+                        "column_id": column_id,
+                        "confidence": _required_confidence(
+                            candidate.get("confidence"), "行归属字段置信度",
+                        ),
+                        "reason": str(candidate.get("reason") or "")[:500],
+                        **metadata_by_column_id[column_id],
+                    })
+                normalized.sort(key=lambda row: row["confidence"], reverse=True)
+                if not normalized:
+                    skipped.append({"table_id": table_id, "reason_code": "ai_no_candidate"})
+                    continue
+                top = normalized[0]
+                margin = top["confidence"] - (
+                    normalized[1]["confidence"] if len(normalized) > 1 else 0.0
+                )
+                confidence_threshold, margin_threshold = _ownership_candidate_thresholds(
+                    policy, top["candidate_tier"],
+                )
+                if top["confidence"] < confidence_threshold or margin < margin_threshold:
+                    skipped.append({
+                        "table_id": table_id,
+                        "column_id": top["column_id"],
+                        "reason_code": "candidate_ambiguous",
+                        "confidence": top["confidence"],
+                        "confidence_threshold": confidence_threshold,
+                        "margin": margin,
+                        "margin_threshold": margin_threshold,
+                        "candidate_tier": top["candidate_tier"],
+                        "metadata_score": top["metadata_score"],
+                        "matched_signals": top["matched_signals"],
+                    })
+                    continue
+                selected.append({
+                    "table": table_by_id[table_id],
+                    "column": column_by_id[top["column_id"]],
+                    "confidence": top["confidence"],
+                    "reason": top["reason"],
+                    "candidate_tier": top["candidate_tier"],
+                    "metadata_score": top["metadata_score"],
+                    "matched_signals": top["matched_signals"],
+                })
+            for table_id in set(batch_by_id) - returned_tables:
+                skipped.append({"table_id": table_id, "reason_code": "ai_no_candidate"})
+
+        config = await get_workspace_db_config_async(snapshot["workspace_id"])
+        if not config:
+            skipped.extend({
+                "table_id": int(item["table"].id),
+                "reason_code": "database_connection_missing",
+            } for item in selected)
+            return {
+                "version": ROW_OWNERSHIP_VERSION,
+                "candidates": [],
+                "skipped": skipped,
+            }
+        connection_url = (
+            config.get_readonly_connection_url()
+            if config.has_readonly_config() else config.get_connection_url()
+        )
+        executor = ReadOnlyExecutor(
+            f"row-ownership-{snapshot['workspace_id']}-{snapshot['datasource_id']}",
+            connection_url,
+            connect_timeout_sec=policy.probe_timeout_sec,
+        )
+        candidates: list[dict[str, Any]] = []
+        for item in selected:
+            profile = await asyncio.to_thread(
+                self._profile_ownership_values_sync,
+                executor,
+                item["table"],
+                item["column"],
+                policy.max_distinct_values,
+                policy.probe_timeout_sec,
+            )
+            if profile.get("status") != "complete" or not profile.get("source_values"):
+                skipped.append({
+                    "table_id": int(item["table"].id),
+                    "column_id": int(item["column"].id),
+                    "reason_code": profile.get("reason_code") or "value_profile_failed",
+                    "candidate_tier": item["candidate_tier"],
+                    "metadata_score": item["metadata_score"],
+                    "matched_signals": item["matched_signals"],
+                })
+                continue
+            mapped = await self._map_ownership_values(
+                item,
+                profile,
+                snapshot["organization_directory"],
+            )
+            candidates.append(mapped)
+        return {
+            "version": ROW_OWNERSHIP_VERSION,
+            "candidates": candidates,
+            "skipped": skipped,
+            "candidate_confidence_threshold": policy.candidate_confidence,
+            "expanded_candidate_confidence_threshold": float(
+                getattr(policy, "expanded_candidate_confidence", 0.95)
+            ),
+            "expanded_candidate_margin_threshold": float(
+                getattr(policy, "expanded_candidate_margin", 0.20)
+            ),
+            "value_confidence_threshold": policy.value_confidence,
+            "expanded_value_confidence_threshold": float(
+                getattr(policy, "expanded_value_confidence", 0.95)
+            ),
+            "candidate_limit": candidate_limit,
+            "max_distinct_values": policy.max_distinct_values,
+        }
+
+    @staticmethod
+    def _profile_ownership_values_sync(
+        executor: ReadOnlyExecutor,
+        table: Any,
+        column: Any,
+        max_distinct_values: int,
+        timeout_sec: int,
+    ) -> dict[str, Any]:
+        table_name = _quote_identifier(table.physical_name)
+        column_name = _quote_identifier(column.physical_name)
+        source_type = _ownership_source_type(column.data_type)
+        empty_expression = (
+            f"SUM(CASE WHEN {column_name} = '' THEN 1 ELSE 0 END)"
+            if source_type == "string" else "0"
+        )
+        aggregate = executor.execute_query(
+            "SELECT COUNT(*) AS total_rows, "
+            f"SUM(CASE WHEN {column_name} IS NULL THEN 1 ELSE 0 END) AS null_rows, "
+            f"{empty_expression} AS empty_rows FROM {table_name}",
+            timeout_sec=timeout_sec,
+            max_rows=2,
+        )
+        if aggregate.error or not aggregate.rows:
+            return {"status": "failed", "reason_code": "value_profile_failed"}
+        summary = dict(zip(aggregate.columns, aggregate.rows[0]))
+        total_rows = int(summary.get("total_rows") or 0)
+        if total_rows <= 0:
+            return {"status": "skipped", "reason_code": "empty_table"}
+        where = f"{column_name} IS NOT NULL"
+        if source_type == "string":
+            where += f" AND {column_name} <> ''"
+        distinct_result = executor.execute_query(
+            f"SELECT {column_name} AS source_value, COUNT(*) AS row_count "
+            f"FROM {table_name} WHERE {where} GROUP BY {column_name} "
+            f"ORDER BY source_value "
+            f"LIMIT {int(max_distinct_values) + 1}",
+            timeout_sec=timeout_sec,
+            max_rows=int(max_distinct_values) + 1,
+        )
+        if distinct_result.error:
+            return {"status": "failed", "reason_code": "value_profile_failed"}
+        if len(distinct_result.rows) > max_distinct_values:
+            return {"status": "skipped", "reason_code": "distinct_value_limit_exceeded"}
+        source_values = []
+        for row in distinct_result.rows:
+            value, count = row[0], int(row[1] or 0)
+            if source_type == "integer":
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    return {"status": "failed", "reason_code": "source_value_type_invalid"}
+            else:
+                value = str(value)
+            source_values.append({
+                "source_type": source_type,
+                "source_value": value,
+                "row_count": count,
+            })
+        return {
+            "status": "complete",
+            "total_rows": total_rows,
+            "null_rows": int(summary.get("null_rows") or 0),
+            "empty_rows": int(summary.get("empty_rows") or 0),
+            "source_values": source_values,
+            "source_domain_fingerprint": stable_fingerprint([
+                (row["source_type"], row["source_value"])
+                for row in source_values
+            ]),
+        }
+
+    async def _map_ownership_values(
+        self,
+        candidate: dict[str, Any],
+        profile: dict[str, Any],
+        organizations: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        policy = self.settings.semantic_row_ownership
+        value_confidence = _ownership_value_confidence(
+            policy, candidate.get("candidate_tier", "strong"),
+        )
+        org_by_id = {int(row["org_unit_id"]): row for row in organizations}
+        code_index: dict[str, list[int]] = {}
+        normalized_index: dict[str, list[int]] = {}
+        for row in organizations:
+            org_id = int(row["org_unit_id"])
+            if row.get("code"):
+                code_index.setdefault(str(row["code"]), []).append(org_id)
+            for value in (row.get("code"), row.get("name"), row.get("full_path")):
+                if value:
+                    normalized_index.setdefault(_normalized_org_value(value), []).append(org_id)
+
+        resolved: dict[tuple[str, str], dict[str, Any]] = {}
+        direct_modes: set[str] = set()
+        unresolved: list[dict[str, Any]] = []
+        for source in profile["source_values"]:
+            source_type = source["source_type"]
+            source_value = source["source_value"]
+            org_id = None
+            match_method = None
+            if source_type == "integer" and int(source_value) in org_by_id:
+                org_id, match_method = int(source_value), "exact_id"
+                direct_modes.add("id")
+            elif source_type == "string" and len(code_index.get(str(source_value), [])) == 1:
+                org_id, match_method = code_index[str(source_value)][0], "exact_code"
+                direct_modes.add("code")
+            else:
+                matches = list(dict.fromkeys(
+                    normalized_index.get(_normalized_org_value(source_value), [])
+                ))
+                if len(matches) == 1:
+                    org_id, match_method = matches[0], "exact_name_or_path"
+                    direct_modes.add("external")
+            if org_id is None:
+                unresolved.append(source)
+                continue
+            resolved[_typed_value_key(source_type, source_value)] = {
+                **source,
+                "target_kind": "org_unit",
+                "org_unit_id": org_id,
+                "confidence": 1.0,
+                "match_method": match_method,
+                "reason": "与现有部门标识唯一匹配",
+            }
+
+        if unresolved:
+            result = await self.llm.generate_json(
+                [{
+                    "role": "system",
+                    "content": (
+                        "把外部组织值映射到给定的 DeluData 部门。只能选择给定 org_unit_id。"
+                        "无法唯一判断时返回 target_kind=unresolved；不得把非空值判断为无归属。"
+                        "输出 JSON: {mappings:[{source_type,source_value,target_kind,org_unit_id,confidence,reason}]}。"
+                    ),
+                }, {
+                    "role": "user",
+                    "content": json.dumps({
+                        "source_values": unresolved,
+                        "departments": organizations,
+                    }, ensure_ascii=False),
+                }],
+                model=getattr(self.settings.llm, "fast_model", self.settings.llm.model),
+                temperature=0,
+                max_tokens=10000,
+            )
+            ai_rows = result.get("mappings") if isinstance(result, dict) else None
+            if not isinstance(ai_rows, list):
+                ai_rows = []
+            unresolved_keys = {
+                _typed_value_key(row["source_type"], row["source_value"]): row
+                for row in unresolved
+            }
+            for row in ai_rows:
+                source_type = str(row.get("source_type") or "")
+                source_value = row.get("source_value")
+                key = _typed_value_key(source_type, source_value)
+                source = unresolved_keys.get(key)
+                org_id = int(row.get("org_unit_id") or 0)
+                confidence = _required_confidence(
+                    row.get("confidence"), "外部组织值映射置信度",
+                )
+                if (
+                    source
+                    and row.get("target_kind") == "org_unit"
+                    and org_id in org_by_id
+                    and confidence >= value_confidence
+                ):
+                    direct_modes.add("external")
+                    resolved[key] = {
+                        **source,
+                        "target_kind": "org_unit",
+                        "org_unit_id": org_id,
+                        "confidence": confidence,
+                        "match_method": "ai",
+                        "reason": str(row.get("reason") or "")[:500],
+                    }
+
+        unresolved_values = [
+            row for row in profile["source_values"]
+            if _typed_value_key(row["source_type"], row["source_value"]) not in resolved
+        ]
+        all_direct_id = not unresolved_values and direct_modes == {"id"} and len(resolved) == len(profile["source_values"])
+        all_direct_code = not unresolved_values and direct_modes == {"code"} and len(resolved) == len(profile["source_values"])
+        org_value_kind = "id" if all_direct_id else "code" if all_direct_code else "external"
+        bindings = [] if org_value_kind in {"id", "code"} else list(resolved.values())
+        table, column = candidate["table"], candidate["column"]
+        blockers = []
+        if unresolved_values:
+            blockers.append({
+                "code": "ownership_values_unresolved",
+                "message": f"{len(unresolved_values)} 个非空归属值尚未映射",
+            })
+        return {
+            "table_id": int(table.id),
+            "table_label": table.business_name,
+            "confidence": float(candidate["confidence"]),
+            "reason": candidate["reason"],
+            "candidate_tier": candidate.get("candidate_tier", "strong"),
+            "metadata_score": int(candidate.get("metadata_score") or 0),
+            "matched_signals": list(candidate.get("matched_signals") or []),
+            "proposed_mapping": {
+                "org_column_id": int(column.id),
+                "org_value_kind": org_value_kind,
+                "org_value_mapping": {
+                    "version": ROW_OWNERSHIP_VERSION,
+                    "bindings": bindings,
+                    "source_domain_fingerprint": profile["source_domain_fingerprint"],
+                },
+                "user_column_id": None,
+                "user_value_kind": "id",
+            },
+            "evidence": [
+                "metadata_scoring_v2",
+                f"candidate_tier:{candidate.get('candidate_tier', 'strong')}",
+                *list(candidate.get("matched_signals") or []),
+                "bounded_distinct_value_profile",
+            ],
+            "validation": {
+                "blockers": blockers,
+                "warnings": [],
+                "total_rows": profile["total_rows"],
+                "null_rows": profile["null_rows"],
+                "empty_rows": profile["empty_rows"],
+                "source_values": profile["source_values"],
+                "unresolved_values": unresolved_values,
+                "value_confidence_threshold": value_confidence,
+                "source_domain_fingerprint": profile["source_domain_fingerprint"],
+            },
+        }
 
     async def _enqueue_in_session(
         self, session, workspace_id: str, datasource_id: int, actor_id: str, *, force: bool,
@@ -1618,6 +2306,10 @@ class PermissionEvidenceService:
             DepartmentModel.parent_id.is_(None),
             DepartmentModel.status == True,  # noqa: E712
         ).order_by(DepartmentModel.id))).scalars())
+        all_departments = list((await session.execute(select(DepartmentModel).where(
+            DepartmentModel.workspace_id == workspace_id,
+            DepartmentModel.status == True,  # noqa: E712
+        ).order_by(DepartmentModel.id))).scalars())
         bindings = list((await session.execute(select(OrganizationSemanticProfileModel).where(
             OrganizationSemanticProfileModel.workspace_id == workspace_id,
             OrganizationSemanticProfileModel.org_unit_id.in_([row.id for row in departments]),
@@ -1660,10 +2352,12 @@ class PermissionEvidenceService:
             "profile_version": profile_by_org[int(row.id)].version,
         } for row in departments]
         table_payload = [{
-            "table_id": int(row.id), "business_name": row.business_name,
+            "table_id": int(row.id), "physical_name": row.physical_name,
+            "business_name": row.business_name,
             "description": row.description or "", "is_sensitive": bool(row.is_sensitive),
             "columns": [{
-                "column_id": int(column.id), "business_name": column.business_name,
+                "column_id": int(column.id), "physical_name": column.physical_name,
+                "business_name": column.business_name,
                 "description": column.description or "", "data_type": column.data_type,
                 "is_sensitive": bool(column.is_sensitive),
             } for column in columns if int(column.table_id) == int(row.id)],
@@ -1678,6 +2372,24 @@ class PermissionEvidenceService:
                  for col in columns if col.table_id == row.id],
             ) for row in tables
         ])
+        department_by_id = {int(row.id): row for row in all_departments}
+
+        def department_path(row: Any) -> str:
+            names, seen = [], set()
+            current = row
+            while current is not None and int(current.id) not in seen:
+                seen.add(int(current.id))
+                names.append(str(current.name))
+                current = department_by_id.get(int(current.parent_id)) if current.parent_id else None
+            return " / ".join(reversed(names))
+
+        organization_directory = [{
+            "org_unit_id": int(row.id),
+            "name": row.name,
+            "code": row.code,
+            "parent_id": int(row.parent_id) if row.parent_id is not None else None,
+            "full_path": department_path(row),
+        } for row in all_departments]
         return {
             "payload": {
                 "business_context": business_context_snapshot(context),
@@ -1689,6 +2401,9 @@ class PermissionEvidenceService:
                 "schema": datasource.schema_fingerprint or "",
                 "semantics": semantic_fp,
             },
+            "workspace_id": workspace_id,
+            "datasource_id": datasource_id,
+            "organization_directory": organization_directory,
             "departments": departments, "tables": tables, "columns": columns,
         }
 

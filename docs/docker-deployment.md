@@ -2,8 +2,9 @@
 
 ## Topology
 
-- `8020`: visitor experience frontend + `/api/experience/*`
-- `8021`: admin frontend + platform frontend (`/platform/`) + `/api/*`
+- `8030`: visitor experience frontend + `/api/experience/*`
+- `8031`: tenant frontend + `/api/*`
+- `8032`: platform frontend (`/platform/`)
 - Internal services: `mysql`, `redis`, `ingestion-worker`
 
 ## 1) Prepare env files
@@ -21,6 +22,10 @@ Fill real values in the copied file:
 - `DASHSCOPE_API_KEY`
 - `DB_ENCRYPTION_KEY`
 
+The optional second Knowledge MCP instance reads `MCP_NBU_ENV_FILE` when set;
+without it, the service uses the same backend environment file. Set this to a
+separate local file only when that instance needs different credentials.
+
 ## 2) Start services
 
 ### Local (GPU)
@@ -37,15 +42,15 @@ BACKEND_ENV_FILE=./backend/.env.docker.cloud docker compose up -d --build
 
 ## 3) Access URLs
 
-- Visitor: `http://<host>:8020`
-- Admin: `http://<host>:8021`
-- Platform: `http://<host>:8021/platform/`
+- Visitor: `http://<host>:8030`
+- Admin: `http://<host>:8031`
+- Platform: `http://<host>:8032/platform/`
 
 ## 4) Health checks
 
 ```bash
-curl http://<host>:8020/health
-curl http://<host>:8021/health
+curl http://<host>:8030/health
+curl http://<host>:8031/health
 ```
 
 ## 5) Database migration from local

@@ -20,6 +20,21 @@ export interface SqlGroup {
 }
 
 /** SQL 示例 */
+export type SqlExampleValidationStatus = 'draft' | 'valid' | 'invalid' | 'stale'
+
+export interface SqlExampleParameter {
+    key: string
+    label: string
+    data_type: 'text' | 'number' | 'date' | string
+    table_id: number
+    column_id: number
+    field: string
+    required: boolean
+    aliases: string[]
+    example_value: string
+    operator?: 'eq' | 'contains' | 'month_range' | string
+}
+
 export interface SqlExample {
     id: number
     question: string
@@ -28,6 +43,13 @@ export interface SqlExample {
     tables: string | null
     is_active: boolean
     group_id: number | null
+    validation_status: SqlExampleValidationStatus
+    validation_errors: Array<{ code: string; message: string; [key: string]: unknown }>
+    parameters: SqlExampleParameter[]
+    normalized_question: string
+    validated_at: string | null
+    last_matched_at: string | null
+    match_count: number
     created_at: string
     updated_at: string
 }
@@ -39,6 +61,16 @@ export interface SqlExampleForm {
     description: string
     tables: string
     group_id: number | null
+    parameters: SqlExampleParameter[]
+    is_active: boolean
+}
+
+export interface SqlExampleValidationResult {
+    status: SqlExampleValidationStatus
+    errors: Array<{ code: string; message: string; [key: string]: unknown }>
+    parameters: SqlExampleParameter[]
+    normalized_question: string
+    preview_sql: string
 }
 
 /** SQL 分组表单 */
@@ -152,8 +184,8 @@ export type SemanticAccessRowScope =
     | { type: 'all' }
     | { type: 'self'; column_id: number; identity: 'user_id' | 'username' }
     | { type: 'department'; column_id: number; include_descendants: boolean }
-    | { type: 'target_org' }
-    | { type: 'target_org_tree' }
+    | { type: 'target_org'; unowned_access?: 'table_grantees' }
+    | { type: 'target_org_tree'; unowned_access?: 'table_grantees' }
     | { type: 'primary_assignment' }
     | { type: 'all_assignments' }
     | { type: 'custom_org'; org_unit_ids: number[]; include_descendants: boolean }
@@ -641,6 +673,21 @@ export interface SemanticBusinessSuggestion {
     accepted_at: string | null
 }
 
+export interface SemanticMatchingObjectRef {
+    object_type: 'table' | 'column' | 'metric'
+    object_id: number
+    table_id: number
+    business_name: string
+    source: 'business_name' | 'synonym'
+}
+
+export interface SemanticMatchingDiagnostic {
+    type: 'generic_term' | 'duplicate_term'
+    severity: 'info' | 'warning' | 'error'
+    term: string
+    objects: SemanticMatchingObjectRef[]
+}
+
 export interface SemanticModelsPayload {
     datasource: SemanticDatasource | null
     tables: SemanticTable[]
@@ -649,6 +696,27 @@ export interface SemanticModelsPayload {
     relationships: SemanticRelationship[]
     business_suggestions: SemanticBusinessSuggestion[]
     recent_runs: SemanticQueryRun[]
+    matching_diagnostics: SemanticMatchingDiagnostic[]
+}
+
+export interface SemanticModelCounts {
+    tables: number
+    queryable_tables: number
+    columns: number
+    queryable_columns: number
+    metrics: number
+    queryable_metrics: number
+    relationships: number
+    queryable_relationships: number
+    stale_assets: number
+    orphaned_assets: number
+    recent_runs: number
+    recent_success_runs: number
+}
+
+export interface SemanticModelOverview {
+    datasource: SemanticDatasource | null
+    counts: SemanticModelCounts
 }
 
 export interface SemanticMetricForm {
@@ -787,7 +855,9 @@ export const EMPTY_SQL_EXAMPLE_FORM: SqlExampleForm = {
     sql: '',
     description: '',
     tables: '',
-    group_id: null
+    group_id: null,
+    parameters: [],
+    is_active: false,
 }
 
 export const EMPTY_SQL_GROUP_FORM: SqlGroupForm = {

@@ -1036,7 +1036,7 @@ async def execute_worker_task(
     if worker == "sql_worker":
         tool_args["summary"] = summary
         tool_args["current_focus_result"] = current_focus_result or {}
-    if worker == "doc_worker":
+    if worker in {"sql_worker", "doc_worker"}:
         tool_args["original_query"] = user_query
     if safe_step_params:
         for k in ALLOWED_STEP_PARAMS:

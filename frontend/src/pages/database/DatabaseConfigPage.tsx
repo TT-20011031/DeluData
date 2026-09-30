@@ -42,6 +42,11 @@ export default function DatabaseConfigPage() {
     const {
         isConnected,
         isLoading,
+        isStatusLoading,
+        hasFetchedStatus,
+        isSchemaLoading,
+        hasFetchedSchema,
+        schemaError,
         error,
         errorCode,
         host,
@@ -145,15 +150,15 @@ export default function DatabaseConfigPage() {
 
     // 初始化时获取状态
     useEffect(() => {
-        fetchStatus()
-    }, [fetchStatus])
+        fetchStatus(true)
+    }, [fetchStatus, user?.id])
 
     // 连接成功后获取 Schema
     useEffect(() => {
-        if (isConnected && schema.length === 0) {
+        if (isConnected && !hasFetchedSchema && !isSchemaLoading) {
             fetchSchema()
         }
-    }, [isConnected, schema.length, fetchSchema])
+    }, [isConnected, hasFetchedSchema, isSchemaLoading, fetchSchema])
 
     const visibleTabs = useMemo<DatabaseTabItem[]>(() => {
         const tabs: DatabaseTabItem[] = [
@@ -315,7 +320,28 @@ export default function DatabaseConfigPage() {
         setIsExecuting(false)
     }
 
-    if (isConnected && !canConfigureConnection && tables.length === 0) {
+    if (!hasFetchedStatus || (isStatusLoading && !isConnected)) {
+        return (
+            <div className="flex-1 flex flex-col h-full bg-manus p-6" aria-busy="true">
+                <div className="m-auto w-full max-w-md text-center">
+                    <div className="relative mx-auto mb-5 h-14 w-14">
+                        <div className="absolute inset-0 rounded-2xl bg-accent/10" />
+                        <Database className="absolute inset-0 m-auto h-7 w-7 text-accent" />
+                        <Loader2 className="absolute -inset-1 h-16 w-16 animate-spin text-accent/35" />
+                    </div>
+                    <h1 className="text-lg font-medium text-manus-text">正在确认数据库连接</h1>
+                    <p className="mt-2 text-sm leading-6 text-manus-muted">
+                        正在读取已保存的连接状态，请稍候。大型数据库不会影响连接是否有效。
+                    </p>
+                    <div className="mx-auto mt-5 h-1 w-40 overflow-hidden rounded-full bg-manus-tertiary">
+                        <div className="h-full w-2/3 animate-pulse rounded-full bg-accent/70" />
+                    </div>
+                </div>
+            </div>
+        )
+    }
+
+    if (isConnected && hasFetchedSchema && !isSchemaLoading && !canConfigureConnection && tables.length === 0) {
         return (
             <div className="flex-1 flex flex-col h-full bg-manus p-6">
                 <div className="m-auto max-w-md text-center text-manus-muted">
@@ -399,6 +425,44 @@ export default function DatabaseConfigPage() {
 
                     {/* 主内容区 */}
                     <div className="flex-1 flex overflow-hidden">
+                        {isSchemaLoading && schema.length === 0 ? (
+                            <div className="flex flex-1 items-center justify-center p-8" aria-busy="true">
+                                <div className="w-full max-w-lg rounded-xl border border-manus-border bg-manus-secondary p-7 shadow-sm">
+                                    <div className="flex items-start gap-4">
+                                        <div className="relative mt-0.5 h-11 w-11 shrink-0 rounded-xl bg-success/10">
+                                            <Database className="absolute inset-0 m-auto h-5 w-5 text-success" />
+                                            <Loader2 className="absolute -inset-1 h-[52px] w-[52px] animate-spin text-success/35" />
+                                        </div>
+                                        <div>
+                                            <div className="flex items-center gap-2">
+                                                <h2 className="font-medium text-manus-text">数据库已连接</h2>
+                                                <span className="rounded-full bg-success/15 px-2 py-0.5 text-xs text-success">连接正常</span>
+                                            </div>
+                                            <p className="mt-2 text-sm leading-6 text-manus-muted">
+                                                正在后台读取表和字段结构。数据库较大时可能需要一些时间，期间可以安全离开此页面，其他功能不受影响。
+                                            </p>
+                                            <div className="mt-4 flex items-center gap-2 text-xs text-manus-subtle">
+                                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                                正在加载 {database}@{host} 的元数据
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        ) : schemaError && schema.length === 0 ? (
+                            <div className="flex flex-1 items-center justify-center p-8">
+                                <div className="max-w-md text-center">
+                                    <Database className="mx-auto h-10 w-10 text-success" />
+                                    <h2 className="mt-4 font-medium text-manus-text">数据库已连接，表结构暂未加载</h2>
+                                    <p className="mt-2 text-sm leading-6 text-manus-muted">{schemaError}</p>
+                                    <Button className="mt-5" onClick={() => fetchSchema()}>
+                                        <RefreshCw className="mr-2 h-4 w-4" />
+                                        重新加载表结构
+                                    </Button>
+                                </div>
+                            </div>
+                        ) : (
+                            <>
                         {activeTab !== 'semantic' && (
                             <DatabaseTableSidebar
                                 schema={schema}
@@ -454,6 +518,8 @@ export default function DatabaseConfigPage() {
                                 </div>
                             )}
                         </div>
+                            </>
+                        )}
                     </div>
                 </div>
 

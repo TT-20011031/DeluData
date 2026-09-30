@@ -1,7 +1,8 @@
 /**
  * SQL 示例编辑对话框
  */
-import { Loader2, Save } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { AlertCircle, CheckCircle2, Loader2, Save, ShieldCheck, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -15,7 +16,8 @@ import {
     DialogFooter,
 } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
-import type { SqlExampleForm, SqlGroup } from '@/types/extendConfig'
+import { sqlExampleService } from '@/services/sqlExampleService'
+import type { SqlExampleForm, SqlExampleValidationResult, SqlGroup } from '@/types/extendConfig'
 
 interface SqlExampleDialogProps {
     /** 是否打开 */
@@ -27,7 +29,7 @@ interface SqlExampleDialogProps {
     /** 表单变化回调 */
     onFormChange: (form: SqlExampleForm) => void
     /** 保存回调 */
-    onSave: () => void
+    onSave: (activate: boolean, form?: SqlExampleForm) => void
     /** 是否正在保存 */
     isSaving: boolean
     /** 是否编辑模式 */
@@ -46,8 +48,39 @@ export function SqlExampleDialog({
     isEditing,
     groups,
 }: SqlExampleDialogProps) {
+    const [isValidating, setIsValidating] = useState(false)
+    const [validation, setValidation] = useState<SqlExampleValidationResult | null>(null)
+
+    useEffect(() => {
+        if (!open) setValidation(null)
+    }, [open])
+
     const updateField = <K extends keyof SqlExampleForm>(key: K, value: SqlExampleForm[K]) => {
         onFormChange({ ...form, [key]: value })
+        if (key === 'question' || key === 'sql' || key === 'parameters') setValidation(null)
+    }
+
+    const validateAndEnable = async () => {
+        if (!form.question.trim() || !form.sql.trim()) return
+        setIsValidating(true)
+        try {
+            const result = await sqlExampleService.validate(form)
+            setValidation(result)
+            const nextForm = { ...form, parameters: result.parameters, is_active: result.status === 'valid' }
+            onFormChange(nextForm)
+            const parametersAlreadyConfirmed = form.parameters.length > 0 || result.parameters.length === 0
+            if (result.status === 'valid' && parametersAlreadyConfirmed) onSave(true, nextForm)
+        } catch (error) {
+            setValidation({
+                status: 'invalid',
+                errors: [{ code: 'request_failed', message: error instanceof Error ? error.message : '校验失败' }],
+                parameters: form.parameters,
+                normalized_question: form.question,
+                preview_sql: '',
+            })
+        } finally {
+            setIsValidating(false)
+        }
     }
 
     return (
@@ -72,6 +105,74 @@ export function SqlExampleDialog({
                             className="bg-manus border-manus-border text-manus-text"
                         />
                     </div>
+
+                    {form.parameters.length > 0 && (
+                        <div className="space-y-2 rounded-lg border border-manus-border bg-manus p-3">
+                            <div>
+                                <Label className="text-manus-text">动态参数确认</Label>
+                                <p className="text-xs text-manus-muted mt-1">
+                                    系统已从问题和 SQL 中识别参数；请确认名称和对应语义字段。
+                                </p>
+                            </div>
+                            {form.parameters.map((parameter, index) => (
+                                <div key={`${parameter.key}-${parameter.column_id}`} className="grid grid-cols-[1fr_1.4fr_auto] gap-2 items-center">
+                                    <Input
+                                        value={parameter.label}
+                                        onChange={(event) => {
+                                            const parameters = [...form.parameters]
+                                            parameters[index] = { ...parameter, label: event.target.value }
+                                            updateField('parameters', parameters)
+                                        }}
+                                        className="bg-manus-secondary border-manus-border text-manus-text"
+                                    />
+                                    <Input
+                                        value={parameter.field}
+                                        readOnly
+                                        title="参数只能绑定当前账号有权查询的语义字段"
+                                        className="bg-manus-secondary border-manus-border text-manus-muted"
+                                    />
+                                    <Button
+                                        type="button"
+                                        variant="ghost"
+                                        size="icon"
+                                        onClick={() => updateField('parameters', form.parameters.filter((_, itemIndex) => itemIndex !== index))}
+                                        className="text-manus-muted hover:text-red-500"
+                                    >
+                                        <X className="h-4 w-4" />
+                                    </Button>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
+                    {validation && (
+                        <div className={cn(
+                            'rounded-lg border p-3 text-sm',
+                            validation.status === 'valid'
+                                ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400'
+                                : 'border-red-500/40 bg-red-500/10 text-red-400',
+                        )}>
+                            <div className="flex items-center gap-2 font-medium">
+                                {validation.status === 'valid'
+                                    ? <CheckCircle2 className="h-4 w-4" />
+                                    : <AlertCircle className="h-4 w-4" />}
+                                {validation.status === 'valid' ? '校验通过，可以启用' : '校验未通过，已保留为草稿'}
+                            </div>
+                            {validation.errors.length > 0 && (
+                                <ul className="mt-2 space-y-1 list-disc pl-5">
+                                    {validation.errors.map((error, index) => <li key={`${error.code}-${index}`}>{error.message}</li>)}
+                                </ul>
+                            )}
+                            {validation.preview_sql && (
+                                <div className="mt-3">
+                                    <p className="mb-1 text-xs font-medium">按当前账号权限生成的安全预览</p>
+                                    <pre className="max-h-36 overflow-auto whitespace-pre-wrap rounded bg-black/20 p-2 font-mono text-xs text-manus-text">
+                                        {validation.preview_sql}
+                                    </pre>
+                                </div>
+                            )}
+                        </div>
+                    )}
 
                     <div className="space-y-2">
                         <Label className="text-manus-text">示例 SQL *</Label>
@@ -151,16 +252,31 @@ export function SqlExampleDialog({
                         取消
                     </Button>
                     <Button
-                        onClick={onSave}
+                        variant="outline"
+                        onClick={() => onSave(false, { ...form, is_active: false })}
                         disabled={isSaving}
-                        className="bg-accent hover:bg-accent/90 text-white"
+                        className="bg-manus border-manus-border text-manus-text"
                     >
                         {isSaving ? (
                             <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                         ) : (
                             <Save className="h-4 w-4 mr-2" />
                         )}
-                        保存
+                        保存草稿
+                    </Button>
+                    <Button
+                        onClick={validateAndEnable}
+                        disabled={isSaving || isValidating}
+                        className="bg-accent hover:bg-accent/90 text-white"
+                    >
+                        {isValidating || isSaving ? (
+                            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                        ) : (
+                            <ShieldCheck className="h-4 w-4 mr-2" />
+                        )}
+                        {form.parameters.length > 0
+                            ? '确认参数并启用'
+                            : '校验并启用'}
                     </Button>
                 </DialogFooter>
             </DialogContent>

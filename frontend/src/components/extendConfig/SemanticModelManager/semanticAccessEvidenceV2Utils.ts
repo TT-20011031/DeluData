@@ -107,6 +107,13 @@ export function isLowEvidenceConfidence(confidence?: number | null): boolean {
   return confidence != null && confidence < EVIDENCE_LOW_CONFIDENCE_THRESHOLD
 }
 
+export function authorizationNeedsReview(
+  decision: 'visible' | 'hidden' | undefined,
+  confirmation?: Pick<EvidenceConfirmationSummary, 'tablePendingItems'>,
+): boolean {
+  return decision === 'visible' && (confirmation?.tablePendingItems || 0) > 0
+}
+
 export function summarizeEvidenceConfirmations(
   assets: EvidenceReviewAssetLike[],
   relations: EvidenceReviewRelationLike[],
@@ -249,4 +256,8 @@ export function accessLevelLabel(level: EvidenceAccessLevel): string {
     visible: '可见',
     partial: '部分可见',
   }[level]
+}
+
+export function shouldPollEvidenceSet(status?: string | null): boolean {
+  return status === 'stale' || status === 'generating'
 }

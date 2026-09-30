@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  authorizationNeedsReview,
   evidenceAccessLevel,
   evidenceBaselineAccess,
   evidenceFieldDecision,
@@ -11,9 +12,18 @@ import {
   isSafeDefault,
   summarizeEvidenceConfirmations,
   summarizeEvidenceReview,
+  shouldPollEvidenceSet,
 } from './semanticAccessEvidenceV2Utils'
 
 describe('semantic access evidence v2 mappings', () => {
+  it('polls only evidence sets that can change in the background', () => {
+    expect(shouldPollEvidenceSet(undefined)).toBe(false)
+    expect(shouldPollEvidenceSet(null)).toBe(false)
+    expect(shouldPollEvidenceSet('review_ready')).toBe(false)
+    expect(shouldPollEvidenceSet('stale')).toBe(true)
+    expect(shouldPollEvidenceSet('generating')).toBe(true)
+  })
+
   it('maps legacy asset classes without expanding access', () => {
     expect(evidenceBaselineAccess({ access_class: 'workspace_public' })).toBe('workspace_visible')
     expect(evidenceBaselineAccess({ access_class: 'department_scoped' })).toBe('controlled')
@@ -79,6 +89,13 @@ describe('semantic access evidence v2 mappings', () => {
     expect(isLowEvidenceConfidence(0.59)).toBe(true)
     expect(isLowEvidenceConfidence(0.6)).toBe(false)
     expect(isLowEvidenceConfidence(null)).toBe(false)
+  })
+
+  it('shows authorization review only for pending visible grants', () => {
+    expect(authorizationNeedsReview('visible', { tablePendingItems: 2 })).toBe(true)
+    expect(authorizationNeedsReview('visible', { tablePendingItems: 0 })).toBe(false)
+    expect(authorizationNeedsReview('hidden', { tablePendingItems: 2 })).toBe(false)
+    expect(authorizationNeedsReview(undefined, { tablePendingItems: 2 })).toBe(false)
   })
 
   it('bulk reviews only non-sensitive fields on ordinary tables', () => {

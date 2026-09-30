@@ -17,7 +17,6 @@ from app.skills.base import SecureSkill
 from app.models.common.context import UserContext
 from app.models.common.execution import QueryResult
 from app.config import get_settings
-from app.models.config.sql_example import search_sql_examples_async, SqlExample
 
 
 class AccessDeniedError(Exception):
@@ -96,12 +95,15 @@ class SqlSkill(SecureSkill):
         workspace_id: str = "default"
     ) -> str:
         """
-        使用 Vanna AI 生成 SQL，并参考配置的 SQL 示例
+        使用 Vanna AI 生成 SQL。
+
+        账号私有 SQL 示例只能通过语义问数权限链路注入结构化意图；
+        此旧生成器不得读取或拼接示例原始 SQL。
         
         Args:
             question: 自然语言问题
             schema_context: 表结构上下文
-            workspace_id: 工作空间ID，用于获取相关的 SQL 示例
+            workspace_id: 工作空间ID（保留用于兼容现有调用）
             
         Returns:
             生成的 SQL 语句
@@ -112,17 +114,8 @@ class SqlSkill(SecureSkill):
         self.log_execution("生成SQL", f"question='{question}'")
         
         try:
-            # 获取相关的 SQL 示例作为参考
-            examples_context = await self._get_sql_examples_context(question, workspace_id)
-            
-            # 构建增强的问题（包含示例参考）
-            enhanced_question = question
-            if examples_context:
-                enhanced_question = f"{question}\n\n参考示例:\n{examples_context}"
-                self.log_execution("找到相关示例", f"{len(examples_context)} 字符")
-            
             # Vanna 生成 SQL
-            sql = self.vanna.generate_sql(enhanced_question)
+            sql = self.vanna.generate_sql(question)
             
             # 清理 SQL
             sql = self._clean_generated_sql(sql)
@@ -133,47 +126,6 @@ class SqlSkill(SecureSkill):
         except Exception as e:
             self.log_error(e, "generate_sql")
             raise
-    
-    async def _get_sql_examples_context(
-        self,
-        question: str,
-        workspace_id: str
-    ) -> str:
-        """
-        根据问题获取相关的 SQL 示例，构建上下文
-        
-        Args:
-            question: 用户问题
-            workspace_id: 工作空间ID
-            
-        Returns:
-            示例上下文字符串
-        """
-        try:
-            # 提取关键词
-            keywords = self._extract_keywords(question)
-            
-            if not keywords:
-                return ""
-            
-            # 搜索相关示例
-            examples = await search_sql_examples_async(workspace_id, keywords)
-            
-            if not examples:
-                return ""
-            
-            # 构建上下文
-            context_parts = []
-            for i, example in enumerate(examples[:3], 1):  # 最多取3个示例
-                context_parts.append(
-                    f"示例{i}:\n问题: {example.question}\nSQL: {example.sql}"
-                )
-            
-            return "\n\n".join(context_parts)
-            
-        except Exception as e:
-            self.log_error(e, "_get_sql_examples_context")
-            return ""
     
     def _extract_keywords(self, text: str) -> List[str]:
         """

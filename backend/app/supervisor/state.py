@@ -85,6 +85,7 @@ class SupervisorState(TypedDict):
     
     # ========== 自动确认机制 (Router 层处理) ==========
     need_confirm: bool  # Planner 判定是否需要用户确认，Router 层据此决定是否自动调用 confirm_and_execute
+    confirmed_sql_query: bool  # 用户确认的计划包含 SQL 查询；SQL 失败/空结果时禁止改用知识库兜底
 
     # ========== 意图分类快速路径 ==========
     skip_planner: bool  # IntentClassifier 判定跳过 Planner（chitchat/direct_answer）

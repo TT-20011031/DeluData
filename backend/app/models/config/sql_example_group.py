@@ -102,7 +102,10 @@ async def create_sql_example_group_async(
         return SqlExampleGroup.from_orm(orm_obj)
 
 
-async def list_sql_example_groups_async(workspace_id: str) -> List[SqlExampleGroup]:
+async def list_sql_example_groups_async(
+    workspace_id: str,
+    owner_id: str,
+) -> List[SqlExampleGroup]:
     """
     获取分组列表（含示例数量）
     
@@ -122,9 +125,14 @@ async def list_sql_example_groups_async(workspace_id: str) -> List[SqlExampleGro
             .select_from(SqlExampleGroupModel)
             .outerjoin(
                 SqlExampleModel,
-                SqlExampleGroupModel.id == SqlExampleModel.group_id
+                (SqlExampleGroupModel.id == SqlExampleModel.group_id)
+                & (SqlExampleModel.workspace_id == workspace_id)
+                & (SqlExampleModel.created_by == owner_id)
             )
-            .where(SqlExampleGroupModel.workspace_id == workspace_id)
+            .where(
+                SqlExampleGroupModel.workspace_id == workspace_id,
+                SqlExampleGroupModel.created_by == owner_id,
+            )
             .group_by(SqlExampleGroupModel.id)
             .order_by(SqlExampleGroupModel.created_at.desc())
         )
@@ -178,7 +186,11 @@ async def update_sql_example_group_async(
         return SqlExampleGroup.from_orm(orm_obj)
 
 
-async def delete_sql_example_group_async(group_id: int) -> bool:
+async def delete_sql_example_group_async(
+    group_id: int,
+    workspace_id: str,
+    owner_id: str,
+) -> bool:
     """
     删除分组（软关联策略：清空组内示例的 group_id）
     """
@@ -189,13 +201,21 @@ async def delete_sql_example_group_async(group_id: int) -> bool:
         # 1. 清空组内示例的 group_id（移至"未分组"）
         await session.execute(
             update(SqlExampleModel)
-            .where(SqlExampleModel.group_id == group_id)
+            .where(
+                SqlExampleModel.group_id == group_id,
+                SqlExampleModel.workspace_id == workspace_id,
+                SqlExampleModel.created_by == owner_id,
+            )
             .values(group_id=None)
         )
         
         # 2. 删除分组
         result = await session.execute(
-            delete(SqlExampleGroupModel).where(SqlExampleGroupModel.id == group_id)
+            delete(SqlExampleGroupModel).where(
+                SqlExampleGroupModel.id == group_id,
+                SqlExampleGroupModel.workspace_id == workspace_id,
+                SqlExampleGroupModel.created_by == owner_id,
+            )
         )
         
         if result.rowcount > 0:

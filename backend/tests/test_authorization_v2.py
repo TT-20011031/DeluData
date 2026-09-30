@@ -33,6 +33,8 @@ from app.services.semantic_policy_binding_service import (
     _context_allows_scope,
     _organization_scope_marker,
     _replace_authorization_condition,
+    _merge_winning_rules,
+    _winning_bindings_for_table,
 )
 
 
@@ -365,6 +367,71 @@ def test_semantic_targets_match_all_effective_assignments_and_department_ancesto
     assert not _binding_matches_assignments(
         SimpleNamespace(target_type="position", target_id="99"), *arguments,
     )
+
+
+def test_account_rule_overrides_position_and_department_for_one_table() -> None:
+    baseline = SimpleNamespace(id=1, target_type="baseline", target_id="*")
+    department = SimpleNamespace(id=2, target_type="org_unit", target_id="10")
+    position = SimpleNamespace(id=3, target_type="position", target_id="8")
+    account = SimpleNamespace(id=4, target_type="user", target_id="u1")
+    rules = {
+        1: {5: {"table_id": 5, "decision": "visible"}},
+        2: {5: {"table_id": 5, "decision": "hidden"}},
+        3: {5: {"table_id": 5, "decision": "hidden"}},
+        4: {5: {"table_id": 5, "decision": "visible"}},
+    }
+    winners = _winning_bindings_for_table(
+        5,
+        baseline_bindings=[baseline],
+        user_binding=account,
+        position_bindings={8: position},
+        org_bindings={10: department},
+        assignment_position_ids={8},
+        assignment_org_ids={10},
+        parent_by_org={10: None},
+        rules=rules,
+    )
+    assert winners == [account]
+    assert _merge_winning_rules(5, winners, rules)["decision"] == "visible"
+
+
+def test_nearest_department_wins_and_same_level_positions_merge_safely() -> None:
+    parent = SimpleNamespace(id=1, target_type="org_unit", target_id="10")
+    child = SimpleNamespace(id=2, target_type="org_unit", target_id="20")
+    first = SimpleNamespace(id=3, target_type="position", target_id="8")
+    second = SimpleNamespace(id=4, target_type="position", target_id="9")
+    rules = {
+        1: {5: {"table_id": 5, "decision": "hidden"}},
+        2: {5: {"table_id": 5, "decision": "visible"}},
+        3: {5: {"table_id": 5, "decision": "visible", "hidden_column_ids": [11]}},
+        4: {5: {"table_id": 5, "decision": "visible", "hidden_column_ids": [12]}},
+    }
+    department_winners = _winning_bindings_for_table(
+        5,
+        baseline_bindings=[],
+        user_binding=None,
+        position_bindings={},
+        org_bindings={10: parent, 20: child},
+        assignment_position_ids=set(),
+        assignment_org_ids={20},
+        parent_by_org={20: 10, 10: None},
+        rules=rules,
+    )
+    assert department_winners == [child]
+    position_winners = _winning_bindings_for_table(
+        5,
+        baseline_bindings=[],
+        user_binding=None,
+        position_bindings={8: first, 9: second},
+        org_bindings={10: parent, 20: child},
+        assignment_position_ids={8, 9},
+        assignment_org_ids={20},
+        parent_by_org={20: 10, 10: None},
+        rules=rules,
+    )
+    merged = _merge_winning_rules(5, position_winners, rules)
+    assert merged["decision"] == "visible"
+    assert merged["hidden_column_ids"] == [11, 12]
 
 
 def test_workspace_provisioning_and_manual_sql_use_v2_contract() -> None:

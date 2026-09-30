@@ -818,6 +818,7 @@ class SemanticAccessPolicyService:
         definition: dict[str, Any],
         *,
         schema_fingerprint: Optional[str],
+        allow_empty_tables: bool = False,
     ) -> dict[str, Any]:
         blockers: list[dict[str, Any]] = []
         warnings: list[dict[str, Any]] = []
@@ -833,7 +834,7 @@ class SemanticAccessPolicyService:
             blockers,
         )
         table_rules = _as_list(definition.get("tables"))
-        if not table_rules:
+        if not table_rules and not allow_empty_tables:
             blockers.append({"code": "tables_empty", "message": "权限配置至少需要一张表"})
 
         for index, rule in enumerate(table_rules):
@@ -950,7 +951,7 @@ class SemanticAccessPolicyService:
                         priority=1000,
                     )
 
-        if not effects and not blockers:
+        if not effects and not blockers and not allow_empty_tables:
             blockers.append({"code": "effects_empty", "message": "配置没有生成任何可见或隐藏规则"})
         affected = {
             asset_type: sorted({item["asset_id"] for item in effects.values() if item["asset_type"] == asset_type})

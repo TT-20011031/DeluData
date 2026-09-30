@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from app.services.semantic_access_policy_service import SemanticAccessPolicyService
 
 
@@ -64,6 +66,45 @@ def _column(column_id: int = 2) -> SimpleNamespace:
         business_name="Mobile",
         physical_name="mobile",
     )
+
+
+@pytest.mark.asyncio
+async def test_target_binding_compiler_allows_empty_sparse_definition(monkeypatch):
+    service = SemanticAccessPolicyService()
+
+    async def validate_subjects(*_args, **_kwargs):
+        return None
+
+    async def resolve_assets(*_args, **_kwargs):
+        return ({}, {"table": {}, "column": {}, "metric": {}})
+
+    monkeypatch.setattr(service, "_validate_subjects", validate_subjects)
+    monkeypatch.setattr(service, "_resolve_assets", resolve_assets)
+
+    compilation = await service._compile_definition(
+        None,
+        "workspace-1",
+        1,
+        {"subject": {"type": "user", "id": "u1"}, "tables": []},
+        schema_fingerprint="schema-1",
+        allow_empty_tables=True,
+    )
+
+    assert compilation["effects"] == []
+    assert compilation["validation"]["blockers"] == []
+    assert compilation["summary"]["effect_count"] == 0
+
+    standalone_compilation = await service._compile_definition(
+        None,
+        "workspace-1",
+        1,
+        {"subject": {"type": "user", "id": "u1"}, "tables": []},
+        schema_fingerprint="schema-1",
+    )
+    assert standalone_compilation["validation"]["blockers"] == [{
+        "code": "tables_empty",
+        "message": "权限配置至少需要一张表",
+    }]
 
 
 def test_unconfigured_member_is_denied_by_default():

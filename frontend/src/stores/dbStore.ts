@@ -3,6 +3,7 @@
 import { getAuthHeader } from './authStore'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api'
+let statusRequestGeneration = 0
 
 async function parseJsonSafe(res: Response): Promise<any> {
     const text = await res.text()
@@ -37,6 +38,11 @@ interface TableSchema {
 interface DBState {
     isConnected: boolean
     isLoading: boolean
+    isStatusLoading: boolean
+    hasFetchedStatus: boolean
+    isSchemaLoading: boolean
+    hasFetchedSchema: boolean
+    schemaError: string | null
     error: string | null
     errorCode: string | null
 
@@ -59,7 +65,7 @@ interface DBState {
     }) => Promise<boolean>
     testConnection: (config: any) => Promise<{ success: boolean, message?: string, code?: string }>
     disconnect: () => Promise<void>
-    fetchStatus: () => Promise<void>
+    fetchStatus: (reset?: boolean) => Promise<void>
     fetchSchema: () => Promise<void>
     clearError: () => void
 }
@@ -67,6 +73,11 @@ interface DBState {
 export const useDBStore = create<DBState>((set, get) => ({
     isConnected: false,
     isLoading: false,
+    isStatusLoading: false,
+    hasFetchedStatus: false,
+    isSchemaLoading: false,
+    hasFetchedSchema: false,
+    schemaError: null,
     error: null,
     errorCode: null,
     host: null,
@@ -106,6 +117,9 @@ export const useDBStore = create<DBState>((set, get) => ({
             set({
                 isConnected: true,
                 isLoading: false,
+                hasFetchedStatus: true,
+                hasFetchedSchema: false,
+                schemaError: null,
                 host: config.host,
                 database: config.database,
                 tables: data.tables || [],
@@ -172,6 +186,10 @@ export const useDBStore = create<DBState>((set, get) => ({
             database: null,
             tables: [],
             schema: [],
+            hasFetchedStatus: true,
+            hasFetchedSchema: false,
+            isSchemaLoading: false,
+            schemaError: null,
             source: null,
             canManageConnection: false,
             canManageSemantic: false,
@@ -181,13 +199,33 @@ export const useDBStore = create<DBState>((set, get) => ({
         })
     },
 
-    fetchStatus: async () => {
+    fetchStatus: async (reset = false) => {
+        const generation = ++statusRequestGeneration
+        set({
+            isStatusLoading: true,
+            ...(reset ? {
+                isConnected: false,
+                host: null,
+                database: null,
+                tables: [],
+                schema: [],
+                source: null,
+                hasFetchedStatus: false,
+                hasFetchedSchema: false,
+                schemaError: null,
+            } : {}),
+        })
         try {
             const response = await fetch(`${API_BASE_URL}/db/status`, {
                 headers: getAuthHeader(),
             })
 
-            if (!response.ok) return
+            if (generation !== statusRequestGeneration) return
+
+            if (!response.ok) {
+                set({ error: '连接状态确认失败，请稍后重试。' })
+                return
+            }
 
             const data = await response.json()
 
@@ -201,9 +239,16 @@ export const useDBStore = create<DBState>((set, get) => ({
                 canManageSemantic: Boolean(data.can_manage_semantic),
                 canQuerySql: Boolean(data.can_query_sql),
                 canAsk: Boolean(data.can_ask),
+                error: null,
             })
         } catch {
-            // ignore
+            if (generation === statusRequestGeneration) {
+                set({ error: '连接状态确认失败，请检查网络后重试。' })
+            }
+        } finally {
+            if (generation === statusRequestGeneration) {
+                set({ isStatusLoading: false, hasFetchedStatus: true })
+            }
         }
     },
 
@@ -211,7 +256,7 @@ export const useDBStore = create<DBState>((set, get) => ({
         const { isConnected } = get()
         if (!isConnected) return
 
-        set({ isLoading: true })
+        set({ isLoading: true, isSchemaLoading: true, schemaError: null })
 
         try {
             const response = await fetch(`${API_BASE_URL}/db/schema`, {
@@ -219,7 +264,12 @@ export const useDBStore = create<DBState>((set, get) => ({
             })
 
             if (!response.ok) {
-                set({ isLoading: false })
+                set({
+                    isLoading: false,
+                    isSchemaLoading: false,
+                    hasFetchedSchema: true,
+                    schemaError: '表结构加载失败，请稍后重试。',
+                })
                 return
             }
 
@@ -227,10 +277,19 @@ export const useDBStore = create<DBState>((set, get) => ({
 
             set({
                 schema: data.tables || [],
+                tables: data.table_names || (data.tables || []).map((table: TableSchema) => table.name),
                 isLoading: false,
+                isSchemaLoading: false,
+                hasFetchedSchema: true,
+                schemaError: null,
             })
         } catch {
-            set({ isLoading: false })
+            set({
+                isLoading: false,
+                isSchemaLoading: false,
+                hasFetchedSchema: true,
+                schemaError: '表结构加载失败，请检查网络后重试。',
+            })
         }
     },
 

@@ -52,6 +52,7 @@ from app.services.semantic_policy_binding_service import (
     SemanticBindingError,
     _context_allows_scope,
     _definition_expands_access,
+    _effective_policy_context,
     _prepare_definition_v3,
     load_bound_semantic_runtime,
     persist_target_policy_version_in_session,
@@ -123,6 +124,7 @@ def _mapping_payload(row: SemanticOwnershipMappingModel | None) -> dict[str, Any
     return {
         "org_column_id": row.org_column_id,
         "org_value_kind": row.org_value_kind,
+        "org_value_mapping": row.org_value_mapping_json or {},
         "user_column_id": row.user_column_id,
         "user_value_kind": row.user_value_kind,
     }
@@ -176,6 +178,91 @@ def _evidence_field_access(relation: Any) -> str:
     if value in {"visible", "hidden"}:
         return value
     return "visible" if getattr(relation, "access_decision", None) == "visible" else "hidden"
+
+
+def _row_ownership_generation_summary(value: Any) -> dict[str, Any]:
+    summary = dict(value or {})
+    return dict(
+        summary.get("row_ownership_v2")
+        or summary.get("row_ownership_v1")
+        or {}
+    )
+
+
+def _merge_table_definition(
+    active_definition: dict[str, Any] | None,
+    draft_definition: dict[str, Any],
+    table_id: int,
+) -> dict[str, Any]:
+    """Replace exactly one table rule while preserving every other active rule."""
+    active_rules = {
+        int(rule["table_id"]): deepcopy(rule)
+        for rule in (active_definition or {}).get("tables") or []
+    }
+    draft_rule = next((
+        deepcopy(rule) for rule in draft_definition.get("tables") or []
+        if int(rule.get("table_id") or 0) == int(table_id)
+    ), None)
+    if draft_rule is None:
+        active_rules.pop(int(table_id), None)
+    else:
+        active_rules[int(table_id)] = draft_rule
+    return {
+        **deepcopy(active_definition or {}),
+        "name": draft_definition.get("name")
+        or (active_definition or {}).get("name")
+        or "问数权限",
+        "tables": [active_rules[key] for key in sorted(active_rules)],
+    }
+
+
+def _review_published_tables(
+    candidates: list[dict[str, Any]],
+    rules_by_table: dict[int, dict[str, Any]],
+    table_ids: set[int],
+) -> list[dict[str, Any]]:
+    """Mark only the published table cells reviewed, preserving other drafts."""
+    reviewed = deepcopy(candidates)
+    for candidate in reviewed:
+        table_id = int(candidate.get("table_id") or 0)
+        if table_id not in table_ids:
+            continue
+        rule = rules_by_table.get(table_id)
+        expected_visible = bool(candidate.get("selected"))
+        if rule is None:
+            candidate["review_state"] = "rejected" if expected_visible else "accepted"
+        else:
+            expected_hidden = set(candidate.get("hidden_column_ids") or [])
+            actual_hidden = set(rule.get("hidden_column_ids") or [])
+            expected_metrics = set(candidate.get("hidden_metric_ids") or [])
+            actual_metrics = set(rule.get("hidden_metric_ids") or [])
+            expected_decision = candidate.get("decision") or (
+                "visible" if expected_visible else "hidden"
+            )
+            expected_scope = candidate.get("row_scope") or "all"
+            if isinstance(expected_scope, str):
+                expected_scope = {"type": expected_scope}
+            actual_scope = rule.get("row_scope") or {"type": "all"}
+            candidate["review_state"] = (
+                "accepted"
+                if rule.get("decision", "visible") == expected_decision
+                and expected_hidden == actual_hidden
+                and expected_metrics == actual_metrics
+                and (expected_decision != "visible" or expected_scope == actual_scope)
+                else "modified"
+            )
+        actual_hidden = set((rule or {}).get("hidden_column_ids") or [])
+        for field in candidate.get("field_suggestions") or []:
+            if rule is None:
+                field["review_state"] = "rejected"
+                continue
+            expected_field_hidden = field.get("effective_decision") == "hidden"
+            field["review_state"] = (
+                "accepted"
+                if (int(field.get("column_id") or 0) in actual_hidden) == expected_field_hidden
+                else "modified"
+            )
+    return reviewed
 
 
 class SemanticAccessBootstrapService:
@@ -874,6 +961,7 @@ class SemanticAccessBootstrapService:
             metrics_by_table: dict[int, list[Any]] = {}
             for metric in metrics:
                 metrics_by_table.setdefault(int(metric.table_id), []).append(metric)
+
             return {
                 "run": run,
                 "datasource": datasource,
@@ -1682,6 +1770,9 @@ class SemanticAccessBootstrapService:
             SemanticAccessBootstrapMappingModel.run_id == run.id,
         ))).scalars())
         mapping_overrides = self._mapping_overrides(mappings)
+        pending_mapping_table_ids = [
+            int(row.table_id) for row in mappings if row.status == "proposed"
+        ]
         datasource = await session.get(SemanticDatasourceModel, run.datasource_id)
         access_service = get_semantic_access_policy_service()
         for target in targets:
@@ -1720,6 +1811,12 @@ class SemanticAccessBootstrapService:
                 "message": f"{len(pending_table_ids)} 条 AI 推荐尚未接受",
                 "table_ids": pending_table_ids,
             }] if pending_table_ids else [])
+            if target.target_type == "baseline" and pending_mapping_table_ids:
+                review_blockers.append({
+                    "code": "ownership_mapping_review_pending",
+                    "message": f"{len(pending_mapping_table_ids)} 个行归属候选尚未确认或拒绝",
+                    "table_ids": pending_mapping_table_ids,
+                })
             binding = SimpleNamespace(
                 id=target.base_binding_id,
                 workspace_id=run.workspace_id,
@@ -1802,6 +1899,29 @@ class SemanticAccessBootstrapService:
                         if normalized != (target.definition_json or {}):
                             target.definition_json = normalized
                             definitions_changed = True
+                    existing_mappings = list((await session.execute(select(
+                        SemanticAccessBootstrapMappingModel,
+                    ).where(
+                        SemanticAccessBootstrapMappingModel.run_id == existing.id,
+                        SemanticAccessBootstrapMappingModel.status == "proposed",
+                    ).with_for_update())).scalars())
+                    embedded_count = 0
+                    for mapping in existing_mappings:
+                        embedded = self._embed_mapping_row_scope_suggestion(
+                            existing_targets,
+                            mapping,
+                            actor_id=actor_id,
+                        )
+                        mapping.status = "embedded" if embedded else "skipped"
+                        mapping.edited_by = actor_id
+                        definitions_changed = True
+                        embedded_count += int(embedded)
+                    if existing_mappings:
+                        existing.summary_json = {
+                            **dict(existing.summary_json or {}),
+                            "row_ownership_embedded_count": embedded_count,
+                            "row_level_configured": embedded_count > 0,
+                        }
                     await self._revalidate_targets(session, existing, existing_targets)
                     if definitions_changed:
                         existing.revision += 1
@@ -1851,6 +1971,36 @@ class SemanticAccessBootstrapService:
             for metric in metrics:
                 metrics_by_table.setdefault(int(metric.table_id), []).append(metric)
 
+            row_ownership_summary = _row_ownership_generation_summary(
+                evidence_set.generation_summary_json,
+            )
+            valid_table_ids = {int(row.id) for row in tables}
+            valid_column_ids_by_table = {
+                (int(row.table_id), int(row.id)) for row in columns
+            }
+            ownership_candidates = {
+                int(row["table_id"]): row
+                for row in (row_ownership_summary.get("candidates") or [])
+                if (
+                    isinstance(row, dict)
+                    and int(row.get("table_id") or 0) in valid_table_ids
+                    and (
+                        int(row.get("table_id") or 0),
+                        int((row.get("proposed_mapping") or {}).get("org_column_id") or 0),
+                    ) in valid_column_ids_by_table
+                )
+            }
+            existing_mappings = list((await session.execute(select(
+                SemanticOwnershipMappingModel,
+            ).where(
+                SemanticOwnershipMappingModel.workspace_id == workspace_id,
+                SemanticOwnershipMappingModel.datasource_id == evidence_set.datasource_id,
+                SemanticOwnershipMappingModel.table_id.in_(list(ownership_candidates) or [-1]),
+            ))).scalars())
+            existing_mapping_by_table = {
+                int(row.table_id): row for row in existing_mappings
+            }
+
             run = SemanticAccessBootstrapRunModel(
                 workspace_id=workspace_id,
                 datasource_id=evidence_set.datasource_id,
@@ -1862,11 +2012,11 @@ class SemanticAccessBootstrapService:
                 schema_fingerprint=semantic_fingerprint,
                 organization_fingerprint=organization_fingerprint,
                 input_snapshot_json={
-                    "bootstrap_mode": "evidence_direct_draft",
+                    "bootstrap_mode": "table_field_row_v1",
                     "evidence_set_id": evidence_set.id,
                     "evidence_set_revision": evidence_set.revision,
                     "assets": _asset_snapshot(tables, columns),
-                    "metadata_only": True,
+                    "metadata_only": False,
                 },
                 summary_json={},
                 triggered_by=actor_id,
@@ -2012,9 +2162,9 @@ class SemanticAccessBootstrapService:
                             else "low"
                         ),
                         "reason": table_reason[:500],
-                        "row_scope": row_scope.get("type", "all"),
+                        "row_scope": row_scope,
                         "requires_mapping": row_scope.get("type") != "all",
-                        "has_mapping_proposal": False,
+                        "has_mapping_proposal": table_id in ownership_candidates,
                         "sensitive": bool(table.is_sensitive),
                         "hidden_column_ids": hidden_column_ids,
                         "hidden_metric_ids": hidden_metric_ids,
@@ -2077,10 +2227,65 @@ class SemanticAccessBootstrapService:
                 session.add(target)
                 targets.append(target)
 
+            mapping_suggestions: list[SemanticAccessBootstrapMappingModel] = []
+            for table_id, candidate in ownership_candidates.items():
+                asset = table_assets.get(table_id)
+                table = next(row for row in tables if int(row.id) == table_id)
+                baseline_visible = bool(
+                    asset
+                    and _evidence_baseline_access(asset) == "workspace_visible"
+                    and not bool(table.is_sensitive)
+                )
+                explicit_org_unit_ids = [
+                    int(org.id)
+                    for org in top_departments
+                    if _evidence_table_access(
+                        table_relations.get((int(org.id), table_id))
+                    ) in {"visible", "partial"}
+                ]
+                scoped_org_unit_ids = (
+                    [int(org.id) for org in top_departments]
+                    if baseline_visible else explicit_org_unit_ids
+                )
+                validation = deepcopy(candidate.get("validation") or {})
+                validation["grant_snapshot"] = {
+                    "baseline_visible": baseline_visible,
+                    "explicit_org_unit_ids": explicit_org_unit_ids,
+                    "scoped_org_unit_ids": scoped_org_unit_ids,
+                }
+                mapping = SemanticAccessBootstrapMappingModel(
+                    workspace_id=workspace_id,
+                    datasource_id=evidence_set.datasource_id,
+                    run_id=run.id,
+                    table_id=table_id,
+                    table_label=candidate.get("table_label") or table.business_name,
+                    status="proposed",
+                    accepted=False,
+                    confidence=_clamp_confidence(candidate.get("confidence")),
+                    base_mapping_json=_mapping_payload(
+                        existing_mapping_by_table.get(table_id),
+                    ),
+                    proposed_mapping_json=deepcopy(candidate.get("proposed_mapping") or {}),
+                    evidence_json=list(candidate.get("evidence") or []),
+                    validation_json=validation,
+                )
+                session.add(mapping)
+                mapping_suggestions.append(mapping)
+
             await session.flush()
+            embedded_count = 0
+            for mapping in mapping_suggestions:
+                embedded = self._embed_mapping_row_scope_suggestion(
+                    targets,
+                    mapping,
+                    actor_id=actor_id,
+                )
+                mapping.status = "embedded" if embedded else "skipped"
+                mapping.edited_by = actor_id
+                embedded_count += int(embedded)
             await self._revalidate_targets(session, run, targets)
             run.summary_json = {
-                "bootstrap_mode": "evidence_direct_draft",
+                "bootstrap_mode": "table_field_row_v1",
                 "target_count": len(targets),
                 "selected_table_rule_count": sum(
                     len((row.definition_json or {}).get("tables") or [])
@@ -2090,8 +2295,12 @@ class SemanticAccessBootstrapService:
                 "low_confidence_field_count": low_confidence_field_count,
                 "sensitive_table_count": sensitive_table_count,
                 "sensitive_field_count": sensitive_field_count,
+                "row_ownership_candidate_count": len(mapping_suggestions),
+                "row_ownership_embedded_count": embedded_count,
+                "row_ownership_skipped_count": len(row_ownership_summary.get("skipped") or []),
+                "row_level_configured": embedded_count > 0,
                 "high_confidence_threshold": HIGH_CONFIDENCE,
-                "metadata_only": True,
+                "metadata_only": False,
             }
             return self._run_payload(run)
 
@@ -2111,6 +2320,24 @@ class SemanticAccessBootstrapService:
             await self._resolve_target_label(
                 session, workspace_id, target_type, target_id,
             )
+            draft_targets = list((await session.execute(select(
+                SemanticAccessBootstrapTargetModel,
+            ).where(
+                SemanticAccessBootstrapTargetModel.run_id == run.id,
+                SemanticAccessBootstrapTargetModel.included == True,  # noqa: E712
+            ))).scalars())
+            policy_context = await _effective_policy_context(
+                session,
+                workspace_id,
+                run.datasource_id,
+                target_type=target_type,
+                target_id=target_id,
+                definition_overrides={
+                    (row.target_type, row.target_id): deepcopy(row.definition_json or {})
+                    for row in draft_targets
+                },
+            )
+            effective_tables = list(policy_context["effective"].values())
             target = (await session.execute(select(
                 SemanticAccessBootstrapTargetModel,
             ).where(
@@ -2119,15 +2346,22 @@ class SemanticAccessBootstrapService:
                 SemanticAccessBootstrapTargetModel.target_id == target_id,
             ))).scalar_one_or_none()
             if target:
+                _binding, active_definition, _active_version_id = await self._binding_snapshot(
+                    session, run, target_type, target_id,
+                )
                 return {
                     "run": self._run_payload(run),
                     "target": self._target_payload(target),
+                    "active_definition": active_definition,
+                    "effective_tables": effective_tables,
                 }
             binding, definition, active_version_id = await self._binding_snapshot(
                 session, run, target_type, target_id,
             )
             return {
                 "run": self._run_payload(run),
+                "active_definition": definition,
+                "effective_tables": effective_tables,
                 "target": {
                     "id": None,
                     "run_id": run.id,
@@ -2196,9 +2430,7 @@ class SemanticAccessBootstrapService:
                     target_type=target_type,
                     target_id=target_id,
                     target_label=label,
-                    include_descendants=(
-                        bool(include_descendants) if target_type == "org_unit" else False
-                    ),
+                    include_descendants=target_type == "org_unit",
                     base_binding_id=int(binding.id) if binding else None,
                     base_revision=int(binding.revision or 0) if binding else 0,
                     included=bool(definition.get("tables")),
@@ -2241,9 +2473,7 @@ class SemanticAccessBootstrapService:
                             )
                 target.definition_json = definition
                 target.candidates_json = candidates
-                target.include_descendants = (
-                    bool(include_descendants) if target_type == "org_unit" else False
-                )
+                target.include_descendants = target_type == "org_unit"
                 target.included = bool(definition.get("tables"))
                 target.status = "edited"
                 target.edited_by = actor_id
@@ -2274,6 +2504,323 @@ class SemanticAccessBootstrapService:
             return {
                 "run": self._run_payload(run),
                 "target": self._target_payload(target),
+            }
+
+    async def publish_target_tables(
+        self,
+        workspace_id: str,
+        run_id: int,
+        target_type: str,
+        target_id: str,
+        actor_id: str,
+        expected_revision: int,
+        *,
+        table_ids: list[int],
+        definition: dict[str, Any],
+        include_descendants: bool,
+        reason: str | None,
+        confirm_warnings: bool = True,
+    ) -> dict[str, Any]:
+        """Persist and activate only the confirmed tables for one target."""
+        selected_table_ids = {int(value) for value in table_ids if int(value) > 0}
+        if not selected_table_ids or len(selected_table_ids) != len(table_ids):
+            raise SemanticAccessBootstrapError(
+                "生效表范围无效或重复", code="publish_tables_invalid",
+            )
+        if target_type not in {"baseline", "org_unit"}:
+            raise SemanticAccessBootstrapError(
+                "首次权限只支持按全员基线或部门生效", code="target_invalid",
+            )
+
+        db = get_async_db_manager()
+        async with db.session_scope() as session:
+            await self._assert_workspace_manage(session, workspace_id, actor_id)
+            run = await self._run(session, workspace_id, run_id, lock=True)
+            self._assert_reviewable(run)
+            self._assert_revision(run, expected_revision)
+            _datasource, governed_tables, _columns, _metrics, semantic_fingerprint = (
+                await self._governed_assets(session, workspace_id, run.datasource_id)
+            )
+            _departments, organization_fingerprint = await self._organization_snapshot(
+                session, workspace_id,
+            )
+            if semantic_fingerprint != run.schema_fingerprint:
+                raise SemanticAccessBootstrapError(
+                    "语义 Schema 已变化，请重新生成", code="schema_changed", status_code=409,
+                )
+            if organization_fingerprint != run.organization_fingerprint:
+                raise SemanticAccessBootstrapError(
+                    "组织架构已变化，请重新生成", code="organization_changed", status_code=409,
+                )
+            governed_table_ids = {int(row.id) for row in governed_tables}
+            if not selected_table_ids.issubset(governed_table_ids):
+                raise SemanticAccessBootstrapError(
+                    "生效范围包含已停用或不存在的语义表", code="table_not_found", status_code=404,
+                )
+
+            label = await self._resolve_target_label(
+                session, workspace_id, target_type, target_id,
+            )
+            draft_definition = self._normalize_draft_definition(definition)
+            await self._validate_definition_assets(session, run, draft_definition)
+            target = (await session.execute(select(
+                SemanticAccessBootstrapTargetModel,
+            ).where(
+                SemanticAccessBootstrapTargetModel.run_id == run.id,
+                SemanticAccessBootstrapTargetModel.target_type == target_type,
+                SemanticAccessBootstrapTargetModel.target_id == target_id,
+            ).with_for_update())).scalar_one_or_none()
+            if target is None:
+                binding, _previous_definition, active_version_id = await self._binding_snapshot(
+                    session, run, target_type, target_id,
+                )
+                target = SemanticAccessBootstrapTargetModel(
+                    workspace_id=workspace_id,
+                    datasource_id=run.datasource_id,
+                    run_id=run.id,
+                    target_type=target_type,
+                    target_id=target_id,
+                    target_label=label,
+                    include_descendants=target_type == "org_unit",
+                    base_binding_id=int(binding.id) if binding else None,
+                    base_revision=int(binding.revision or 0) if binding else 0,
+                    included=bool(draft_definition.get("tables")),
+                    status="edited",
+                    confidence=0.0,
+                    definition_json=draft_definition,
+                    candidates_json=[],
+                    explanation_json=[],
+                    validation_json={
+                        "blockers": [], "warnings": [],
+                        "base_active_version_id": active_version_id,
+                    },
+                    edited_by=actor_id,
+                )
+                session.add(target)
+                await session.flush()
+            else:
+                target.definition_json = draft_definition
+                target.include_descendants = target_type == "org_unit"
+                target.included = bool(draft_definition.get("tables"))
+                target.edited_by = actor_id
+
+            binding = (await session.execute(select(SemanticPolicyBindingModel).where(
+                SemanticPolicyBindingModel.workspace_id == workspace_id,
+                SemanticPolicyBindingModel.datasource_id == run.datasource_id,
+                SemanticPolicyBindingModel.target_type == target_type,
+                SemanticPolicyBindingModel.target_id == target_id,
+            ).with_for_update())).scalar_one_or_none()
+            current_binding_id = int(binding.id) if binding else None
+            if current_binding_id != target.base_binding_id:
+                raise SemanticAccessBootstrapError(
+                    "目标绑定已变化，请刷新后重试", code="target_binding_conflict", status_code=409,
+                )
+            current_active_version_id = int(binding.active_version_id) if binding and binding.active_version_id else None
+            if current_active_version_id != (target.validation_json or {}).get("base_active_version_id"):
+                raise SemanticAccessBootstrapError(
+                    "目标生效版本已变化，请刷新后重试", code="target_configured_conflict", status_code=409,
+                )
+            if int(getattr(binding, "revision", 0) or 0) != int(target.base_revision or 0):
+                raise SemanticAccessBootstrapError(
+                    "目标策略修订已变化，请刷新后重试", code="target_revision_conflict", status_code=409,
+                )
+            active_definition: dict[str, Any] = {"name": label, "tables": []}
+            if binding and binding.active_version_id:
+                active_version = await session.get(
+                    SemanticPolicyVersionModel, binding.active_version_id,
+                )
+                if active_version:
+                    active_definition = deepcopy(active_version.definition_json or active_definition)
+            if binding is None:
+                binding = SemanticPolicyBindingModel(
+                    workspace_id=workspace_id,
+                    datasource_id=run.datasource_id,
+                    target_type=target_type,
+                    target_id=target_id,
+                    include_descendants=target_type == "org_unit",
+                    status=True,
+                    created_by=actor_id,
+                )
+                session.add(binding)
+                await session.flush()
+            else:
+                binding.include_descendants = target_type == "org_unit"
+                binding.status = True
+
+            published_definition = active_definition
+            for table_id in sorted(selected_table_ids):
+                published_definition = _merge_table_definition(
+                    published_definition, draft_definition, table_id,
+                )
+
+            mappings = list((await session.execute(select(
+                SemanticAccessBootstrapMappingModel,
+            ).where(
+                SemanticAccessBootstrapMappingModel.run_id == run.id,
+                SemanticAccessBootstrapMappingModel.table_id.in_(selected_table_ids),
+            ).with_for_update())).scalars())
+            mapping_overrides = self._mapping_overrides(mappings)
+            for mapping in mappings:
+                if not mapping.accepted or mapping.status != "accepted":
+                    continue
+                current_mapping = (await session.execute(select(
+                    SemanticOwnershipMappingModel,
+                ).where(
+                    SemanticOwnershipMappingModel.workspace_id == workspace_id,
+                    SemanticOwnershipMappingModel.datasource_id == run.datasource_id,
+                    SemanticOwnershipMappingModel.table_id == mapping.table_id,
+                ).with_for_update())).scalar_one_or_none()
+                if _mapping_payload(current_mapping) != dict(mapping.base_mapping_json or {}):
+                    raise SemanticAccessBootstrapError(
+                        f"{mapping.table_label} 的归属映射已变化，请刷新后重试",
+                        code="mapping_conflict", status_code=409,
+                    )
+                await upsert_ownership_mapping_in_session(
+                    session,
+                    workspace_id=workspace_id,
+                    datasource_id=run.datasource_id,
+                    table_id=mapping.table_id,
+                    payload=dict(mapping.proposed_mapping_json or {}),
+                    actor_id=actor_id,
+                )
+                mapping.status = "applied"
+
+            previous = {
+                "active_version_id": binding.active_version_id,
+                "revision": binding.revision,
+            }
+            try:
+                version, _compilation, warnings = await persist_target_policy_version_in_session(
+                    session,
+                    binding,
+                    published_definition,
+                    actor_id,
+                    source_text=reason or f"按表确认：{','.join(map(str, sorted(selected_table_ids)))}",
+                    source_type="evidence_table_confirm",
+                    source_ref=f"evidence_set:{run.evidence_set_id or 0}",
+                    confirm_warnings=confirm_warnings,
+                    mapping_overrides=mapping_overrides,
+                )
+            except SemanticBindingError as exc:
+                raise SemanticAccessBootstrapError(
+                    str(exc), code=exc.code, status_code=exc.status_code, details=exc.details,
+                ) from exc
+
+            draft_rules = {
+                int(rule["table_id"]): rule
+                for rule in draft_definition.get("tables") or []
+            }
+            target.candidates_json = _review_published_tables(
+                target.candidates_json or [], draft_rules, selected_table_ids,
+            )
+            target.status = "partially_applied"
+            target.base_binding_id = int(binding.id)
+            target.base_revision = int(binding.revision or 0)
+            target.validation_json = {
+                **dict(target.validation_json or {}),
+                "base_active_version_id": int(version.id),
+                "last_published_table_ids": sorted(selected_table_ids),
+            }
+
+            evidence_set = None
+            if run.evidence_set_id:
+                evidence_set = (await session.execute(select(
+                    SemanticAccessEvidenceSetModel,
+                ).where(
+                    SemanticAccessEvidenceSetModel.id == run.evidence_set_id,
+                    SemanticAccessEvidenceSetModel.workspace_id == workspace_id,
+                ).with_for_update())).scalar_one_or_none()
+            if evidence_set:
+                now = datetime.now()
+                if target_type == "baseline":
+                    rows = list((await session.execute(select(
+                        SemanticAccessEvidenceAssetModel,
+                    ).where(
+                        SemanticAccessEvidenceAssetModel.evidence_set_id == evidence_set.id,
+                        SemanticAccessEvidenceAssetModel.asset_type == "table",
+                        SemanticAccessEvidenceAssetModel.table_id.in_(selected_table_ids),
+                    ))).scalars())
+                else:
+                    rows = list((await session.execute(select(
+                        SemanticAccessEvidenceRelationModel,
+                    ).where(
+                        SemanticAccessEvidenceRelationModel.evidence_set_id == evidence_set.id,
+                        SemanticAccessEvidenceRelationModel.org_unit_id == int(target_id),
+                        SemanticAccessEvidenceRelationModel.table_id.in_(selected_table_ids),
+                    ))).scalars())
+                for row in rows:
+                    published_rule = draft_rules.get(int(row.table_id))
+                    row.review_status = "modified"
+                    row.reviewed_by = actor_id
+                    row.reviewed_at = now
+                    if target_type == "baseline":
+                        row.baseline_access = (
+                            "workspace_visible" if published_rule is not None else "controlled"
+                        )
+                        row.access_class = (
+                            "workspace_public" if published_rule is not None else "restricted"
+                        )
+                    elif row.asset_type == "table":
+                        row.access_level = (
+                            "visible"
+                            if published_rule is not None
+                            and (published_rule.get("row_scope") or {}).get("type", "all") == "all"
+                            else "partial" if published_rule is not None else "hidden"
+                        )
+                        row.access_decision = (
+                            "visible" if published_rule is not None else "hidden"
+                        )
+                    elif row.asset_type == "column":
+                        hidden_columns = set(
+                            (published_rule or {}).get("hidden_column_ids") or []
+                        )
+                        row.field_decision = (
+                            "visible"
+                            if published_rule is not None and int(row.asset_id) not in hidden_columns
+                            else "hidden"
+                        )
+                        row.access_decision = row.field_decision
+                evidence_set.revision += 1
+                from app.services.permission_evidence_service import get_permission_evidence_service
+                await get_permission_evidence_service()._refresh_progress(session, evidence_set)
+
+            await self._revalidate_targets(session, run, [target])
+
+            datasource = await self._datasource(
+                session, workspace_id, run.datasource_id,
+            )
+            datasource.access_bootstrap_required = False
+            if evidence_set:
+                datasource.active_evidence_set_id = evidence_set.id
+            authorization_revision = await bump_authorization_revision(session, workspace_id)
+            audit = await record_authorization_audit(
+                session,
+                workspace_id=workspace_id,
+                actor_id=actor_id,
+                action="semantic_policy.evidence_table.activate",
+                target_type=f"semantic_{target_type}",
+                target_id=target_id,
+                before=previous,
+                after={
+                    "active_version_id": version.id,
+                    "revision": binding.revision,
+                    "table_ids": sorted(selected_table_ids),
+                },
+                reason=f"bootstrap_run:{run.id}",
+            )
+            run.revision += 1
+            await session.flush()
+            return {
+                "run": self._run_payload(run),
+                "target": self._target_payload(target),
+                "active_definition": published_definition,
+                "binding_id": binding.id,
+                "binding_revision": binding.revision,
+                "version_id": version.id,
+                "version": version.version,
+                "warnings": warnings,
+                "audit_id": audit.id,
+                "authorization_revision": authorization_revision,
             }
 
     async def _binding_snapshot(
@@ -2406,8 +2953,187 @@ class SemanticAccessBootstrapService:
             "hidden_metric_ids": [int(value) for value in candidate.get("hidden_metric_ids") or []],
         }
         if decision == "visible":
-            rule["row_scope"] = {"type": candidate.get("row_scope") or "all"}
+            scope = candidate.get("row_scope") or "all"
+            rule["row_scope"] = (
+                deepcopy(scope) if isinstance(scope, dict) else {"type": scope}
+            )
         return rule
+
+    @staticmethod
+    def _row_scope_suggestions_from_mapping(
+        mapping: SemanticAccessBootstrapMappingModel,
+    ) -> dict[str, dict[str, Any]]:
+        """Build explicit custom conditions only for complete ownership domains."""
+        proposed = dict(mapping.proposed_mapping_json or {})
+        validation = dict(mapping.validation_json or {})
+        if (
+            list(validation.get("blockers") or [])
+            or list(validation.get("unresolved_values") or [])
+            or int(validation.get("null_rows") or 0) > 0
+            or int(validation.get("empty_rows") or 0) > 0
+        ):
+            return {}
+
+        column_id = int(proposed.get("org_column_id") or 0)
+        value_mapping = proposed.get("org_value_mapping") or {}
+        bindings = value_mapping.get("bindings") or []
+        source_values = validation.get("source_values") or []
+        if column_id <= 0 or not isinstance(bindings, list) or not source_values:
+            return {}
+
+        binding_by_source: dict[tuple[str, str], dict[str, Any]] = {}
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                return {}
+            key = (
+                str(binding.get("source_type") or ""),
+                str(binding.get("source_value")),
+            )
+            if key in binding_by_source:
+                return {}
+            binding_by_source[key] = binding
+
+        values_by_org: dict[str, list[Any]] = {}
+        for source in source_values:
+            if not isinstance(source, dict):
+                return {}
+            key = (
+                str(source.get("source_type") or ""),
+                str(source.get("source_value")),
+            )
+            binding = binding_by_source.get(key)
+            if not binding or binding.get("target_kind") != "org_unit":
+                return {}
+            org_unit_id = int(binding.get("org_unit_id") or 0)
+            if org_unit_id <= 0:
+                return {}
+            values_by_org.setdefault(str(org_unit_id), []).append(
+                source.get("source_value"),
+            )
+
+        result: dict[str, dict[str, Any]] = {}
+        for org_unit_id, values in values_by_org.items():
+            unique_values = list(dict.fromkeys(values))
+            if not unique_values:
+                continue
+            result[org_unit_id] = {
+                "type": "custom",
+                "condition": {
+                    "column_id": column_id,
+                    "operator": "=" if len(unique_values) == 1 else "in",
+                    "value": unique_values[0] if len(unique_values) == 1 else unique_values,
+                },
+            }
+        return result
+
+    def _embed_mapping_row_scope_suggestion(
+        self,
+        targets: list[SemanticAccessBootstrapTargetModel],
+        mapping: SemanticAccessBootstrapMappingModel,
+        *,
+        actor_id: str,
+    ) -> bool:
+        """Place a safe row-scope suggestion directly on the matching department table."""
+        scope_by_org = self._row_scope_suggestions_from_mapping(mapping)
+        if not scope_by_org:
+            return False
+
+        snapshot = dict((mapping.validation_json or {}).get("grant_snapshot") or {})
+        baseline_visible = bool(snapshot.get("baseline_visible"))
+        explicitly_granted = {
+            str(value) for value in snapshot.get("explicit_org_unit_ids") or []
+        }
+        scoped_org_ids = {
+            str(value) for value in snapshot.get("scoped_org_unit_ids") or []
+        }
+        table_id = int(mapping.table_id)
+        embedded = False
+
+        for target in targets:
+            candidates = deepcopy(target.candidates_json or [])
+            candidate = next((
+                row for row in candidates
+                if int(row.get("table_id") or 0) == table_id
+            ), None)
+            if candidate is None:
+                continue
+            rules = {
+                int(row["table_id"]): deepcopy(row)
+                for row in (target.definition_json or {}).get("tables") or []
+            }
+
+            if target.target_type == "baseline":
+                if baseline_visible:
+                    rules.pop(table_id, None)
+                    candidate["selected"] = False
+                    candidate["decision"] = "hidden"
+                    candidate["row_scope"] = {"type": "all"}
+                    candidate["requires_mapping"] = False
+                target.definition_json = {
+                    **dict(target.definition_json or {}),
+                    "name": target.target_label,
+                    "tables": list(rules.values()),
+                }
+                target.candidates_json = candidates
+                continue
+
+            if target.target_type != "org_unit":
+                continue
+            target_id = str(target.target_id)
+            originally_granted = (
+                target_id in explicitly_granted
+                or baseline_visible and target_id in scoped_org_ids
+            )
+            suggested_scope = scope_by_org.get(target_id)
+            if not originally_granted:
+                continue
+            if suggested_scope is None:
+                if baseline_visible:
+                    candidate["selected"] = True
+                    candidate["decision"] = "visible"
+                    candidate["row_scope"] = {"type": "all"}
+                    candidate["requires_mapping"] = False
+                    candidate.pop("row_scope_suggestion", None)
+                    candidate.pop("row_scope_suggestion_id", None)
+                    rules[table_id] = self._rule_from_candidate(candidate)
+                    target.definition_json = {
+                        **dict(target.definition_json or {}),
+                        "name": target.target_label,
+                        "tables": list(rules.values()),
+                    }
+                    target.candidates_json = candidates
+                    target.included = True
+                    target.status = "edited"
+                    target.edited_by = actor_id
+                continue
+
+            candidate["selected"] = True
+            candidate["decision"] = "visible"
+            candidate["row_scope"] = deepcopy(suggested_scope)
+            candidate["requires_mapping"] = False
+            candidate["has_mapping_proposal"] = True
+            candidate["row_scope_suggestion"] = True
+            candidate["row_scope_suggestion_id"] = int(mapping.id)
+            candidate["confidence"] = float(
+                mapping.confidence or candidate.get("confidence") or 0,
+            )
+            candidate["confidence_level"] = (
+                "high" if candidate["confidence"] >= HIGH_CONFIDENCE
+                else "medium" if candidate["confidence"] >= REVIEW_CONFIDENCE
+                else "low"
+            )
+            rules[table_id] = self._rule_from_candidate(candidate)
+            target.definition_json = {
+                **dict(target.definition_json or {}),
+                "name": target.target_label,
+                "tables": list(rules.values()),
+            }
+            target.candidates_json = candidates
+            target.included = True
+            target.status = "edited"
+            target.edited_by = actor_id
+            embedded = True
+        return embedded
 
     @staticmethod
     def _normalize_draft_definition(definition: dict[str, Any]) -> dict[str, Any]:
@@ -2478,6 +3204,75 @@ class SemanticAccessBootstrapService:
             "validation": row.validation_json or {},
             "updated_at": _serialize_datetime(row.updated_at),
         }
+
+    async def _apply_mapping_scope_decision(
+        self,
+        session,
+        run: SemanticAccessBootstrapRunModel,
+        mapping: SemanticAccessBootstrapMappingModel,
+        *,
+        accepted: bool,
+        actor_id: str,
+    ) -> list[SemanticAccessBootstrapTargetModel]:
+        """Deterministically scope every department that already had table access."""
+        targets = list((await session.execute(select(
+            SemanticAccessBootstrapTargetModel,
+        ).where(
+            SemanticAccessBootstrapTargetModel.run_id == run.id,
+        ).with_for_update())).scalars())
+        snapshot = dict((mapping.validation_json or {}).get("grant_snapshot") or {})
+        baseline_visible = bool(snapshot.get("baseline_visible"))
+        explicit_org_ids = {str(value) for value in snapshot.get("explicit_org_unit_ids") or []}
+        scoped_org_ids = {str(value) for value in snapshot.get("scoped_org_unit_ids") or []}
+        table_id = int(mapping.table_id)
+        for target in targets:
+            candidates = deepcopy(target.candidates_json or [])
+            candidate = next((
+                row for row in candidates
+                if int(row.get("table_id") or 0) == table_id
+            ), None)
+            if candidate is None:
+                continue
+            rules = {
+                int(row["table_id"]): deepcopy(row)
+                for row in (target.definition_json or {}).get("tables") or []
+            }
+            if accepted:
+                should_grant = (
+                    target.target_type == "org_unit"
+                    and str(target.target_id) in scoped_org_ids
+                )
+            else:
+                should_grant = (
+                    target.target_type == "baseline" and baseline_visible
+                    or target.target_type == "org_unit"
+                    and str(target.target_id) in explicit_org_ids
+                )
+            candidate["selected"] = bool(should_grant)
+            candidate["decision"] = "visible" if should_grant else "hidden"
+            candidate["row_scope"] = (
+                {
+                    "type": "target_org_tree",
+                    "unowned_access": "table_grantees",
+                }
+                if accepted and should_grant else {"type": "all"}
+            )
+            candidate["requires_mapping"] = bool(accepted and should_grant)
+            candidate["has_mapping_proposal"] = True
+            if should_grant:
+                rules[table_id] = self._rule_from_candidate(candidate)
+            else:
+                rules.pop(table_id, None)
+            target.definition_json = {
+                **dict(target.definition_json or {}),
+                "name": target.target_label,
+                "tables": list(rules.values()),
+            }
+            target.candidates_json = candidates
+            target.included = bool(rules)
+            target.status = "edited"
+            target.edited_by = actor_id
+        return targets
 
     async def update_target(
         self,
@@ -2562,15 +3357,152 @@ class SemanticAccessBootstrapService:
             if not row:
                 raise SemanticAccessBootstrapError("归属映射建议不存在", code="mapping_suggestion_not_found", status_code=404)
             if accepted:
-                await self._validate_mapping_payload(session, run, row.table_id, proposed_mapping)
+                await self._validate_mapping_payload(
+                    session,
+                    run,
+                    row.table_id,
+                    proposed_mapping,
+                    row.validation_json or {},
+                )
             row.accepted = bool(accepted)
             row.status = "accepted" if accepted else "rejected"
             row.proposed_mapping_json = proposed_mapping
             row.edited_by = actor_id
+            targets = await self._apply_mapping_scope_decision(
+                session=session,
+                run=run,
+                mapping=row,
+                accepted=accepted,
+                actor_id=actor_id,
+            )
             run.revision += 1
-            await self._revalidate_targets(session, run)
+            await self._revalidate_targets(session, run, targets)
+            all_mappings = list((await session.execute(select(
+                SemanticAccessBootstrapMappingModel,
+            ).where(
+                SemanticAccessBootstrapMappingModel.run_id == run.id,
+            ))).scalars())
+            accepted_count = sum(
+                1 for item in all_mappings
+                if item.accepted and item.status == "accepted"
+            )
+            run.summary_json = {
+                **dict(run.summary_json or {}),
+                "row_ownership_accepted_count": accepted_count,
+                "row_ownership_rejected_count": sum(
+                    1 for item in all_mappings if item.status == "rejected"
+                ),
+                "row_level_configured": accepted_count > 0,
+            }
             await session.flush()
-            return {"run": self._run_payload(run), "mapping": self._mapping_suggestion_payload(row)}
+            return {
+                "run": self._run_payload(run),
+                "mapping": self._mapping_suggestion_payload(row),
+                "targets": [self._target_payload(target) for target in targets],
+            }
+
+    async def review_ownership_mappings(
+        self,
+        workspace_id: str,
+        run_id: int,
+        actor_id: str,
+        expected_revision: int,
+        decisions: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Apply row-ownership reviews atomically and advance the revision once."""
+        if not decisions or len(decisions) > 1000:
+            raise SemanticAccessBootstrapError(
+                "批量行归属审核需要提交 1 到 1000 个决定",
+                code="mapping_reviews_invalid",
+            )
+        suggestion_ids = [int(row.get("suggestion_id") or 0) for row in decisions]
+        if any(value <= 0 for value in suggestion_ids) or len(set(suggestion_ids)) != len(suggestion_ids):
+            raise SemanticAccessBootstrapError(
+                "批量行归属审核包含无效或重复的建议",
+                code="mapping_reviews_duplicated",
+            )
+        for decision in decisions:
+            if decision.get("action") not in {"accept", "reject"}:
+                raise SemanticAccessBootstrapError(
+                    "批量行归属审核操作无效",
+                    code="mapping_review_action_invalid",
+                )
+
+        db = get_async_db_manager()
+        async with db.session_scope() as session:
+            await self._assert_workspace_manage(session, workspace_id, actor_id)
+            run = await self._run(session, workspace_id, run_id, lock=True)
+            self._assert_reviewable(run)
+            self._assert_revision(run, expected_revision)
+            mappings = list((await session.execute(select(
+                SemanticAccessBootstrapMappingModel,
+            ).where(
+                SemanticAccessBootstrapMappingModel.run_id == run.id,
+                SemanticAccessBootstrapMappingModel.id.in_(suggestion_ids),
+            ).with_for_update())).scalars())
+            mapping_by_id = {int(row.id): row for row in mappings}
+            if set(suggestion_ids) != set(mapping_by_id):
+                raise SemanticAccessBootstrapError(
+                    "批量行归属审核包含不存在的建议",
+                    code="mapping_suggestion_not_found",
+                    status_code=404,
+                )
+
+            targets: list[SemanticAccessBootstrapTargetModel] = []
+            for decision in decisions:
+                mapping = mapping_by_id[int(decision["suggestion_id"])]
+                accepted = decision["action"] == "accept"
+                proposed_mapping = (
+                    decision.get("proposed_mapping")
+                    if decision.get("proposed_mapping") is not None
+                    else dict(mapping.proposed_mapping_json or {})
+                )
+                if accepted:
+                    await self._validate_mapping_payload(
+                        session,
+                        run,
+                        mapping.table_id,
+                        proposed_mapping,
+                        mapping.validation_json or {},
+                    )
+                mapping.accepted = accepted
+                mapping.status = "accepted" if accepted else "rejected"
+                mapping.proposed_mapping_json = proposed_mapping
+                mapping.edited_by = actor_id
+                targets = await self._apply_mapping_scope_decision(
+                    session=session,
+                    run=run,
+                    mapping=mapping,
+                    accepted=accepted,
+                    actor_id=actor_id,
+                )
+
+            await self._revalidate_targets(session, run, targets or None)
+            all_mappings = list((await session.execute(select(
+                SemanticAccessBootstrapMappingModel,
+            ).where(
+                SemanticAccessBootstrapMappingModel.run_id == run.id,
+            ).order_by(SemanticAccessBootstrapMappingModel.table_id))).scalars())
+            accepted_count = sum(
+                1 for row in all_mappings
+                if row.accepted and row.status == "accepted"
+            )
+            rejected_count = sum(1 for row in all_mappings if row.status == "rejected")
+            run.summary_json = {
+                **dict(run.summary_json or {}),
+                "row_ownership_accepted_count": accepted_count,
+                "row_ownership_rejected_count": rejected_count,
+                "row_level_configured": accepted_count > 0,
+            }
+            run.revision += 1
+            await session.flush()
+            return {
+                "run": self._run_payload(run),
+                "ownership_mappings": [
+                    self._mapping_suggestion_payload(row) for row in all_mappings
+                ],
+                "targets": [self._target_payload(target) for target in targets],
+            }
 
     async def review_decisions(
         self,
@@ -2675,11 +3607,20 @@ class SemanticAccessBootstrapService:
                 "targets": [self._target_payload(row) for row in targets],
             }
 
-    async def _validate_mapping_payload(self, session, run, table_id: int, payload: dict[str, Any]) -> None:
+    async def _validate_mapping_payload(
+        self,
+        session,
+        run,
+        table_id: int,
+        payload: dict[str, Any],
+        validation: dict[str, Any] | None = None,
+    ) -> None:
         column_id = payload.get("org_column_id")
         if column_id is None:
-            raise SemanticAccessBootstrapError("组织归属字段不能为空", code="ownership_column_required")
-        valid = (await session.execute(select(SemanticColumnModel.id).where(
+            raise SemanticAccessBootstrapError(
+                "组织归属字段不能为空", code="ownership_column_required",
+            )
+        column = (await session.execute(select(SemanticColumnModel).where(
             SemanticColumnModel.workspace_id == run.workspace_id,
             SemanticColumnModel.datasource_id == run.datasource_id,
             SemanticColumnModel.table_id == table_id,
@@ -2688,10 +3629,120 @@ class SemanticAccessBootstrapService:
             SemanticColumnModel.sync_state == "current",
             SemanticColumnModel.is_queryable == True,  # noqa: E712
         ))).scalar_one_or_none()
-        if valid is None:
-            raise SemanticAccessBootstrapError("组织归属字段无效", code="ownership_column_invalid")
-        if payload.get("org_value_kind") not in {"id", "code"}:
-            raise SemanticAccessBootstrapError("组织归属值类型无效", code="ownership_value_kind_invalid")
+        if column is None:
+            raise SemanticAccessBootstrapError(
+                "组织归属字段无效", code="ownership_column_invalid",
+            )
+        value_kind = payload.get("org_value_kind")
+        if value_kind not in {"id", "code", "external"}:
+            raise SemanticAccessBootstrapError(
+                "组织归属值类型无效", code="ownership_value_kind_invalid",
+            )
+        value_mapping = payload.get("org_value_mapping") or {}
+        if not isinstance(value_mapping, dict):
+            raise SemanticAccessBootstrapError(
+                "组织值映射格式无效", code="ownership_value_mapping_invalid",
+            )
+        bindings = value_mapping.get("bindings") or []
+        if not isinstance(bindings, list):
+            raise SemanticAccessBootstrapError(
+                "组织值映射格式无效", code="ownership_value_mapping_invalid",
+            )
+        source_values = list((validation or {}).get("source_values") or [])
+        source_keys = {
+            (str(row.get("source_type") or ""), str(row.get("source_value")))
+            for row in source_values if isinstance(row, dict)
+        }
+        binding_keys: set[tuple[str, str]] = set()
+        requested_org_ids: set[int] = set()
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                raise SemanticAccessBootstrapError(
+                    "组织值映射格式无效", code="ownership_value_mapping_invalid",
+                )
+            source_type = str(binding.get("source_type") or "")
+            source_value = binding.get("source_value")
+            if (
+                source_type not in {"string", "integer"}
+                or isinstance(source_value, (bool, list, dict))
+                or source_type == "string" and not isinstance(source_value, str)
+                or source_type == "integer" and not isinstance(source_value, int)
+            ):
+                raise SemanticAccessBootstrapError(
+                    "组织源值格式无效", code="ownership_source_value_invalid",
+                )
+            key = (source_type, str(source_value))
+            if key in binding_keys:
+                raise SemanticAccessBootstrapError(
+                    "组织源值重复", code="ownership_source_value_duplicated",
+                )
+            if source_keys and key not in source_keys:
+                raise SemanticAccessBootstrapError(
+                    "组织值映射包含探测范围外的源值", code="ownership_source_value_unknown",
+                )
+            binding_keys.add(key)
+            if binding.get("target_kind") == "org_unit":
+                org_unit_id = int(binding.get("org_unit_id") or 0)
+                if not org_unit_id:
+                    raise SemanticAccessBootstrapError(
+                        "组织源值缺少目标部门", code="ownership_target_required",
+                    )
+                requested_org_ids.add(org_unit_id)
+            elif binding.get("target_kind") == "unowned":
+                if not binding.get("manual_unowned") or not str(binding.get("reason") or "").strip():
+                    raise SemanticAccessBootstrapError(
+                        "非空值标记为无归属需要明确确认并填写原因",
+                        code="ownership_unowned_confirmation_required",
+                    )
+            else:
+                raise SemanticAccessBootstrapError(
+                    "组织源值目标无效", code="ownership_target_invalid",
+                )
+        departments = list((await session.execute(select(DepartmentModel).where(
+            DepartmentModel.workspace_id == run.workspace_id,
+            DepartmentModel.status == True,  # noqa: E712
+        ))).scalars())
+        department_by_id = {int(row.id): row for row in departments}
+        if not requested_org_ids.issubset(department_by_id):
+            raise SemanticAccessBootstrapError(
+                "组织值映射包含无效目标部门", code="ownership_target_invalid",
+            )
+        if value_kind == "external" and binding_keys != source_keys:
+            raise SemanticAccessBootstrapError(
+                "仍有非空归属值未映射",
+                code="ownership_values_unresolved",
+                details={"unresolved_count": len(source_keys - binding_keys)},
+            )
+        if value_kind == "id":
+            valid_ids = set(department_by_id)
+            if any(
+                row.get("source_type") != "integer"
+                or int(row.get("source_value")) not in valid_ids
+                for row in source_values
+            ):
+                raise SemanticAccessBootstrapError(
+                    "归属字段包含无法匹配的部门 ID", code="ownership_values_unresolved",
+                )
+        if value_kind == "code":
+            codes = [str(row.code) for row in departments if row.code not in {None, ""}]
+            if len(codes) != len(set(codes)):
+                raise SemanticAccessBootstrapError(
+                    "工作区部门编码不唯一", code="organization_code_conflict",
+                )
+            valid_codes = set(codes)
+            if any(
+                row.get("source_type") != "string"
+                or str(row.get("source_value")) not in valid_codes
+                for row in source_values
+            ):
+                raise SemanticAccessBootstrapError(
+                    "归属字段包含无法匹配的部门编码", code="ownership_values_unresolved",
+                )
+        expected_fingerprint = (validation or {}).get("source_domain_fingerprint")
+        if expected_fingerprint and value_mapping.get("source_domain_fingerprint") != expected_fingerprint:
+            raise SemanticAccessBootstrapError(
+                "归属值域指纹不一致", code="ownership_value_domain_changed", status_code=409,
+            )
 
     def _assert_reviewable(self, run) -> None:
         if run.status != "review_ready":
@@ -2843,10 +3894,7 @@ class SemanticAccessBootstrapService:
                     )
                     session.add(binding)
                     await session.flush()
-                binding.include_descendants = (
-                    bool(target.include_descendants)
-                    if target.target_type == "org_unit" else False
-                )
+                binding.include_descendants = target.target_type == "org_unit"
                 binding.status = True
                 binding_by_target[(target.target_type, target.target_id)] = binding
 
@@ -3090,7 +4138,7 @@ class SemanticAccessBootstrapService:
                     datasource_id=run.datasource_id,
                     target_type=target.target_type,
                     target_id=target.target_id,
-                    include_descendants=target.include_descendants,
+                    include_descendants=target.target_type == "org_unit",
                 )
                 prepared, _ownership = await _prepare_definition_v3(
                     session,

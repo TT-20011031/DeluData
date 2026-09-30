@@ -39,6 +39,12 @@ class SemanticModelsResponse(BaseModel):
     relationships: list[dict[str, Any]] = Field(default_factory=list)
     business_suggestions: list[dict[str, Any]] = Field(default_factory=list)
     recent_runs: list[dict[str, Any]] = Field(default_factory=list)
+    matching_diagnostics: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SemanticModelOverviewResponse(BaseModel):
+    datasource: Optional[dict[str, Any]] = None
+    counts: dict[str, int] = Field(default_factory=dict)
 
 
 def _semantic_access_asset_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -71,6 +77,7 @@ def _semantic_access_asset_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "relationships": [],
         "business_suggestions": [],
         "recent_runs": [],
+        "matching_diagnostics": [],
     }
 
 
@@ -355,6 +362,15 @@ async def get_semantic_models(admin: User = Depends(get_current_admin)):
 
 
 @router.get(
+    "/semantic/overview",
+    response_model=SemanticModelOverviewResponse,
+    summary="获取语义模型轻量概览",
+)
+async def get_semantic_model_overview(admin: User = Depends(get_current_admin)):
+    return await get_semantic_query_service().get_model_overview(admin.workspace_id)
+
+
+@router.get(
     "/semantic/access-assets",
     response_model=SemanticModelsResponse,
     summary="获取问数权限可配置资产",
@@ -592,6 +608,23 @@ async def generate_business_suggestions(
             table_id=request.table_id,
             force=request.force,
             use_llm=request.use_llm,
+        )
+    except SemanticQueryError as exc:
+        raise _semantic_error(exc) from exc
+
+
+@router.get(
+    "/semantic/business-suggestions/tables/{table_id}",
+    summary="获取当前表待处理业务语义建议",
+)
+async def list_table_business_suggestions(
+    table_id: int,
+    admin: User = Depends(get_current_admin),
+):
+    try:
+        return await get_semantic_query_service().list_table_business_suggestions(
+            admin.workspace_id,
+            table_id,
         )
     except SemanticQueryError as exc:
         raise _semantic_error(exc) from exc
@@ -940,7 +973,8 @@ class SemanticTargetPolicySaveRequest(SemanticBindingSaveRequest):
 
 class SemanticOwnershipMappingRequest(BaseModel):
     org_column_id: Optional[int] = None
-    org_value_kind: Literal["id", "code"] = "id"
+    org_value_kind: Literal["id", "code", "external"] = "id"
+    org_value_mapping: dict[str, Any] = Field(default_factory=dict)
     user_column_id: Optional[int] = None
     user_value_kind: Literal["id", "username"] = "id"
 
@@ -962,6 +996,21 @@ class SemanticBindingRollbackRequest(BaseModel):
 
 class SemanticBindingSuggestionRequest(BaseModel):
     source_text: str = Field(min_length=1, max_length=8000)
+
+
+class SemanticSimilarSuggestionPreviewRequest(BaseModel):
+    datasource_id: int
+    org_unit_id: int
+    source_table_id: int
+    source_before_rule: Optional[dict[str, Any]] = None
+    expected_binding_revision: int = Field(ge=0)
+    bootstrap_run_id: Optional[int] = None
+    expected_bootstrap_revision: Optional[int] = Field(default=None, ge=0)
+
+
+class SemanticSimilarSuggestionApplyRequest(SemanticSimilarSuggestionPreviewRequest):
+    batch_fingerprint: str = Field(min_length=64, max_length=64)
+    candidate_ids: list[str] = Field(min_length=1, max_length=50)
 
 
 def _semantic_binding_http_error(exc: Exception) -> HTTPException:
@@ -1019,6 +1068,50 @@ async def get_semantic_access_targets(
             page,
             page_size,
             unassigned,
+        )
+    except Exception as exc:
+        raise _semantic_binding_http_error(exc) from exc
+
+
+@router.post(
+    "/semantic/access-policy-similar-suggestions/preview",
+    summary="生成部门问数权限相似修改建议",
+)
+async def preview_semantic_access_similar_suggestions(
+    request: SemanticSimilarSuggestionPreviewRequest,
+    admin: User = Depends(CheckPerm("semantic_access:manage")),
+):
+    from app.services.semantic_access_similar_suggestion_service import (
+        get_semantic_access_similar_suggestion_service,
+    )
+
+    try:
+        return await get_semantic_access_similar_suggestion_service().preview(
+            admin.workspace_id,
+            str(admin.id),
+            request.model_dump(),
+        )
+    except Exception as exc:
+        raise _semantic_binding_http_error(exc) from exc
+
+
+@router.post(
+    "/semantic/access-policy-similar-suggestions/apply",
+    summary="原子应用部门问数权限相似修改建议",
+)
+async def apply_semantic_access_similar_suggestions(
+    request: SemanticSimilarSuggestionApplyRequest,
+    admin: User = Depends(CheckPerm("semantic_access:manage")),
+):
+    from app.services.semantic_access_similar_suggestion_service import (
+        get_semantic_access_similar_suggestion_service,
+    )
+
+    try:
+        return await get_semantic_access_similar_suggestion_service().apply(
+            admin.workspace_id,
+            str(admin.id),
+            request.model_dump(),
         )
     except Exception as exc:
         raise _semantic_binding_http_error(exc) from exc

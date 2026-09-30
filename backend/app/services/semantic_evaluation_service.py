@@ -25,6 +25,10 @@ class SemanticEvalCase:
     test_dimension: str
     expected_focus: list[str] = field(default_factory=list)
     expected_limit: Optional[int] = None
+    expected_query_type: Optional[str] = None
+    expected_tables: list[str] = field(default_factory=list)
+    required_sql_fragments: list[str] = field(default_factory=list)
+    forbidden_sql_fragments: list[str] = field(default_factory=list)
 
     def model_dump(self) -> dict[str, Any]:
         return {
@@ -33,6 +37,10 @@ class SemanticEvalCase:
             "test_dimension": self.test_dimension,
             "expected_focus": self.expected_focus,
             "expected_limit": self.expected_limit,
+            "expected_query_type": self.expected_query_type,
+            "expected_tables": self.expected_tables,
+            "required_sql_fragments": self.required_sql_fragments,
+            "forbidden_sql_fragments": self.forbidden_sql_fragments,
         }
 
 
@@ -43,11 +51,31 @@ class SemanticEvaluationRunRequest(BaseModel):
 EVALUATION_CASES: list[SemanticEvalCase] = [
     SemanticEvalCase("case_01", "查询最近 30 天销售订单明细，显示订单号、客户名称、制单日期、交货日期、订单状态，最多 50 条", "明细查询、limit、销售订单主表", ["limit", "客户名称", "日期格式"], 50),
     SemanticEvalCase("case_02", "统计 2026 年 5 月销售订单总金额、订单数量、明细数量和平均单价", "指标汇总、订单主从表", ["平均单价口径", "订单主从表"], None),
-    SemanticEvalCase("case_03", "按月统计 2025 年 3 月到 2026 年 5 月的销售金额趋势", "趋势分析、时间字段选择", ["月度趋势", "时间字段"], None),
+    SemanticEvalCase(
+        "case_03",
+        "按月统计 2025 年 3 月到 2026 年 5 月的销售金额趋势",
+        "趋势分析、时间字段选择",
+        ["月度趋势", "时间字段"],
+        None,
+        "trend",
+        ["clean_jf_sale_order"],
+        ["2025-03-01", "2026-06-01", "date_format"],
+        [],
+    ),
     SemanticEvalCase("case_04", "查询销售金额最高的 10 个客户，并显示订单数、总数量、总金额", "TopN、客户维度、聚合", ["Join fanout", "重复指标"], 10),
     SemanticEvalCase("case_05", "查询交货日期已经过期但订单状态未完成的销售订单", "状态口径、逾期判断", ["状态码", "逾期"], None),
     SemanticEvalCase("case_06", "查询近 180 天销售数量最高的 10 个品名，显示货号、规格、数量、金额", "TopN、商品维度", ["字段空值", "字段映射"], 10),
-    SemanticEvalCase("case_07", "对比 2026 年 4 月和 5 月各客户的销售金额变化", "对比分析、月份窗口", ["FULL OUTER JOIN", "MySQL 方言"], None),
+    SemanticEvalCase(
+        "case_07",
+        "对比 2026 年 4 月和 5 月各客户的销售金额变化",
+        "对比分析、月份窗口",
+        ["FULL OUTER JOIN", "MySQL 方言"],
+        None,
+        "compare",
+        ["clean_jf_sale_order"],
+        ["2026-04", "2026-05", "变化金额", "变化率"],
+        ["full outer join"],
+    ),
     SemanticEvalCase("case_08", "查询当前库存数量最低的 20 个物料，显示品名、规格、颜色、色号、库存数量", "库存明细、排序", ["空值提示", "库存排序"], 20),
     SemanticEvalCase("case_09", "统计近 180 天各物料的入库数量、出库数量和当前库存", "多表联查、库存口径", ["入库", "出库", "当前库存"], None),
     SemanticEvalCase("case_10", "查询近 180 天库存周转率最差的 10 个品名", "复杂指标、入出库+库存", ["库存周转率口径", "TopN"], 10),
@@ -84,6 +112,8 @@ def _compact_result(result: dict[str, Any], elapsed_ms: int) -> dict[str, Any]:
             "execution_time_ms": elapsed_ms,
             "from_example": bool(result.get("from_example")),
             "from_semantic": bool(result.get("from_semantic")),
+            "semantic_intent": result.get("semantic_intent") or result.get("intent") or {},
+            "semantic_plan": result.get("semantic_plan") or result.get("plan") or {},
         }
     )
 
@@ -92,12 +122,45 @@ def _verdict(semantic: dict[str, Any], legacy: dict[str, Any]) -> str:
     return str(compare_execution_results(semantic, legacy)["verdict"])
 
 
+def _contract_diagnostics(semantic: dict[str, Any], case: SemanticEvalCase) -> list[dict[str, Any]]:
+    if not bool(semantic.get("success")):
+        return []
+    violations: list[str] = []
+    intent = semantic.get("semantic_intent") or {}
+    if case.expected_query_type and intent.get("query_type") != case.expected_query_type:
+        violations.append(
+            f"query_type expected={case.expected_query_type} actual={intent.get('query_type')}"
+        )
+    referenced = {str(item).lower() for item in semantic.get("referenced_tables") or []}
+    for table in case.expected_tables:
+        if table.lower() not in referenced:
+            violations.append(f"missing_table={table}")
+    sql = str(semantic.get("sql") or "")
+    sql_lower = sql.lower()
+    for fragment in case.required_sql_fragments:
+        if fragment.lower() not in sql_lower:
+            violations.append(f"missing_sql_fragment={fragment}")
+    for fragment in case.forbidden_sql_fragments:
+        if fragment.lower() in sql_lower:
+            violations.append(f"forbidden_sql_fragment={fragment}")
+    if not violations:
+        return []
+    return [{
+        "type": "contract_violation",
+        "severity": "error",
+        "case_id": case.case_id,
+        "violations": violations,
+    }]
+
+
 def _semantic_verdict(semantic: dict[str, Any]) -> str:
     """Evaluate the semantic chain on its own, independent from legacy XiYan."""
 
     if not bool(semantic.get("success")):
         return "fail"
     diagnostics = semantic.get("diagnostics") or []
+    if any(item.get("type") == "contract_violation" for item in diagnostics if isinstance(item, dict)):
+        return "fail"
     if diagnostics:
         return "pass_with_warnings"
     return "pass"
@@ -178,6 +241,10 @@ class SemanticEvaluationService:
             run_mode="legacy_only",
         )
         semantic_payload = _compact_result(semantic_result, semantic_elapsed)
+        semantic_payload["diagnostics"] = list(semantic_payload.get("diagnostics") or []) + _contract_diagnostics(
+            semantic_payload,
+            case,
+        )
         legacy_payload = _compact_result(legacy_result, legacy_elapsed)
         comparison = compare_execution_results(semantic_payload, legacy_payload)
         diagnostics = _jsonable(
@@ -220,6 +287,7 @@ class SemanticEvaluationService:
         try:
             result = await worker.execute_task(
                 task_description=case.question,
+                original_query=case.question,
                 user_id=user_id,
                 session_id=f"semantic-eval-{case.case_id}-{run_mode}",
                 parent_step_id="semantic-evaluation",

@@ -287,6 +287,7 @@ class ChatService:
                 "latest_quality_signal": {},
                 "route_action": "continue",
                 "need_confirm": True,
+                "confirmed_sql_query": False,
                 "interrupt_signal": None,
                 "memory_dfs": previous_memory_dfs,  # [修复] 保留跨轮次数据
                 "current_focus_result": previous_focus_result,
@@ -410,8 +411,16 @@ class ChatService:
                 raise PermissionError("session not found for current user")
             
             # 准备更新的数据
-            update_payload = {"plan_status": "confirmed"}
-            if modified_steps:
+            effective_steps = modified_steps if modified_steps is not None else owned_state.values.get("task_plan", [])
+            update_payload = {
+                "plan_status": "confirmed",
+                "confirmed_sql_query": any(
+                    str(step.get("worker") or "") == "sql_worker"
+                    for step in effective_steps
+                    if isinstance(step, dict)
+                ),
+            }
+            if modified_steps is not None:
                 update_payload["task_plan"] = modified_steps
             
             # [关键] 使用 as_node="planner" 以上一个节点身份更新状态

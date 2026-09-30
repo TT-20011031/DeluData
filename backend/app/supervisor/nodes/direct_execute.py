@@ -304,6 +304,7 @@ async def _execute_worker(
         worker = get_sql_worker()
         result = await worker.execute_task(
             task_description=query,
+            original_query=query,
             user_id=user_context.get("user_id", ""),
             session_id=session_id,
             parent_step_id=parent_step_id,

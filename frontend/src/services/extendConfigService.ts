@@ -5,6 +5,7 @@
  */
 import { getAuthHeader } from '@/stores/authStore'
 import { API_BASE_URL } from '@/config'
+import { splitSemanticTerms } from '@/utils/semanticTerms'
 import type {
     SqlExample,
     SqlGroup,
@@ -23,12 +24,14 @@ import type {
     SemanticAccessPolicy,
     SemanticAccessPolicyDraftInput,
     SemanticAssetTag,
+    SemanticBusinessSuggestion,
     SemanticEvalCase,
     SemanticEvalRun,
     SemanticGovernanceCandidate,
     SemanticGovernanceEvidenceFact,
     SemanticGovernancePolicy,
     SemanticGovernanceRun,
+    SemanticModelOverview,
     SemanticModelsPayload,
     SemanticMetricForm,
     SemanticPreviewErrorDetail,
@@ -99,6 +102,18 @@ export const extendConfigService = {
 
         if (!response.ok) {
             throw new Error(`获取语义模型失败: ${response.status}`)
+        }
+
+        return response.json()
+    },
+
+    async getSemanticModelOverview(): Promise<SemanticModelOverview> {
+        const response = await fetch(`${API_BASE_URL}/config/semantic/overview`, {
+            headers: getAuthHeader(),
+        })
+
+        if (!response.ok) {
+            throw new Error(`获取语义模型概览失败: ${response.status}`)
         }
 
         return response.json()
@@ -579,6 +594,19 @@ export const extendConfigService = {
         return response.json()
     },
 
+    async getTableBusinessSuggestions(tableId: number): Promise<SemanticBusinessSuggestion[]> {
+        const response = await fetch(
+            `${API_BASE_URL}/config/semantic/business-suggestions/tables/${tableId}`,
+            { headers: getAuthHeader() },
+        )
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({}))
+            const detail = typeof error.detail === 'object' ? error.detail.message : error.detail
+            throw new Error(detail || '获取当前表语义建议失败')
+        }
+        return response.json()
+    },
+
     async acceptTableBusinessSuggestions(tableId: number): Promise<{ accepted_count: number }> {
         const response = await fetch(`${API_BASE_URL}/config/semantic/business-suggestions/tables/${tableId}/accept-all`, {
             method: 'POST',
@@ -692,7 +720,7 @@ export const extendConfigService = {
                 time_column_id: form.time_column_id,
                 default_grain: form.default_grain || null,
                 description: form.description,
-                synonyms: form.synonyms.split(',').map(s => s.trim()).filter(Boolean),
+                synonyms: splitSemanticTerms(form.synonyms),
                 status: form.status,
                 is_queryable: form.is_queryable,
                 is_sensitive: form.is_sensitive,

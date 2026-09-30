@@ -16,11 +16,12 @@ from datetime import datetime, timedelta
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, inspect, or_, select, update
+from sqlalchemy import and_, case, func, inspect, or_, select, update
 from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
 from app.core.db.database import get_async_db_manager
+from app.core.db.mysql_connection_policy import create_mysql_engine
 from app.core.db.read_only_executor import ReadOnlyExecutor
 from app.core.llm.async_llm import get_async_llm
 from app.models.auth.organization import DepartmentModel
@@ -94,6 +95,20 @@ class _RelationshipSuggestion:
     description: str
 
 
+@dataclass(frozen=True)
+class _SemanticMatch:
+    object_type: Literal["table", "column", "metric"]
+    object_id: int
+    output_name: str
+    table_id: int
+    term: str
+    start: int
+    end: int
+    source: Literal["business_name", "technical_name", "synonym", "loose_table"]
+    source_rank: int
+    confidence: float
+
+
 SEMANTIC_SAFE_ERROR_TYPES = {
     "permission_denied",
     "permission_rewrite_required",
@@ -104,6 +119,8 @@ SEMANTIC_SAFE_ERROR_TYPES = {
     "readonly_execution_failed",
     "unsafe_sql",
     "semantic_disabled",
+    "metric_ambiguous",
+    "semantic_model_incomplete",
 }
 
 SEMANTIC_TERM_ZH = {
@@ -210,6 +227,11 @@ class IntentQuery(BaseModel):
     tables: list[str] = Field(default_factory=list)
     metrics: list[str] = Field(default_factory=list)
     dimensions: list[str] = Field(default_factory=list)
+    # ``None`` preserves the fail-closed meaning for legacy/manual intents:
+    # every supplied dimension is treated as explicit.  Extracted intents set
+    # this to a list (possibly empty) so default projections can be separated
+    # from fields the user actually named.
+    explicit_dimensions: Optional[list[str]] = None
     filters: list[dict[str, Any]] = Field(default_factory=list)
     time_range: Optional[str] = None
     order_by: list[dict[str, str]] = Field(default_factory=list)
@@ -217,6 +239,9 @@ class IntentQuery(BaseModel):
     confidence: float = 0.65
     clarification_items: list[str] = Field(default_factory=list)
     selected_time_column_id: Optional[int] = None
+    # Persisted only in the semantic query audit record.  It is excluded from
+    # ordinary API/chat payloads so internal candidate IDs are not exposed.
+    matching_trace: list[dict[str, Any]] = Field(default_factory=list, exclude=True)
 
 
 class SemanticClarificationOption(BaseModel):
@@ -262,6 +287,7 @@ class SemanticExecutionResult(BaseModel):
     execution_time_ms: int = 0
     run_id: Optional[int] = None
     diagnostics: list[dict[str, Any]] = Field(default_factory=list)
+    sql_example_match: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -357,6 +383,12 @@ def _terms_for(*values: str, synonyms: Optional[list[str]] = None) -> list[str]:
         if value:
             terms.append(str(value))
     terms.extend(str(item) for item in (synonyms or []) if item)
+    for term in list(terms):
+        terms.extend(
+            part.strip()
+            for part in re.split(r"[,，;；、\n]+", term)
+            if part.strip() and part.strip() != term
+        )
     seen = set()
     output = []
     for term in terms:
@@ -410,12 +442,15 @@ def _is_time_type(data_type: str) -> bool:
 
 
 def _is_time_column(column: SemanticColumn) -> bool:
-    text = _normalize_term(
-        " ".join([column.physical_name, column.business_name, column.description or "", *column.synonyms])
-    )
-    return _is_time_type(column.data_type) or any(
-        token in text
-        for token in ("date", "time", "日期", "时间", "月份", "年度", "年份")
+    if _is_time_type(column.data_type):
+        return True
+    text = " ".join(
+        [column.physical_name, column.business_name, column.description or "", *column.synonyms]
+    ).lower()
+    english_text = re.sub(r"[_\W]+", " ", text)
+    return bool(
+        re.search(r"\b(?:date|time|datetime|timestamp|year|month)\b", english_text)
+        or any(token in text for token in ("日期", "时间", "月份", "年度", "年份"))
     )
 
 
@@ -1184,9 +1219,11 @@ class SemanticQueryService:
                 (
                     await session.execute(
                         select(SemanticBusinessSuggestionModel)
-                        .where(SemanticBusinessSuggestionModel.workspace_id == workspace_id)
+                        .where(
+                            SemanticBusinessSuggestionModel.workspace_id == workspace_id,
+                            SemanticBusinessSuggestionModel.status == "pending",
+                        )
                         .order_by(
-                            SemanticBusinessSuggestionModel.status.asc(),
                             SemanticBusinessSuggestionModel.confidence.desc(),
                             SemanticBusinessSuggestionModel.updated_at.desc(),
                         )
@@ -1209,6 +1246,7 @@ class SemanticQueryService:
                     for item in suggestions
                 ],
                 "recent_runs": [SemanticQueryRun.from_orm(run).model_dump(mode="json") for run in runs],
+                "matching_diagnostics": [],
             }
         return {
             "datasource": catalog.datasource.model_dump(mode="json"),
@@ -1221,7 +1259,136 @@ class SemanticQueryService:
                 for item in suggestions
             ],
             "recent_runs": [SemanticQueryRun.from_orm(run).model_dump(mode="json") for run in runs],
+            "matching_diagnostics": self.build_matching_diagnostics(catalog),
         }
+
+    async def get_model_overview(self, workspace_id: str) -> dict[str, Any]:
+        """Return the semantic landing-page counters without loading every asset.
+
+        Large workspaces can contain tens of thousands of semantic objects.  The
+        landing page only needs counts, so loading and serializing the complete
+        catalog here would waste database, API and browser resources.
+        """
+        datasource = await self.get_active_datasource(workspace_id)
+        empty_counts = {
+            "tables": 0,
+            "queryable_tables": 0,
+            "columns": 0,
+            "queryable_columns": 0,
+            "metrics": 0,
+            "queryable_metrics": 0,
+            "relationships": 0,
+            "queryable_relationships": 0,
+            "stale_assets": 0,
+            "orphaned_assets": 0,
+            "recent_runs": 0,
+            "recent_success_runs": 0,
+        }
+        if not datasource:
+            return {"datasource": None, "counts": empty_counts}
+
+        db_manager = get_async_db_manager()
+        counts = dict(empty_counts)
+        async with db_manager.get_session() as session:
+            model_specs = (
+                ("tables", "queryable_tables", SemanticTableModel),
+                ("columns", "queryable_columns", SemanticColumnModel),
+                ("metrics", "queryable_metrics", SemanticMetricModel),
+                ("relationships", "queryable_relationships", SemanticRelationshipModel),
+            )
+            for total_key, queryable_key, model in model_specs:
+                total, queryable, stale, orphaned = (
+                    await session.execute(
+                        select(
+                            func.count(model.id),
+                            func.coalesce(func.sum(case((
+                                (model.status == "confirmed")
+                                & (model.is_queryable.is_(True))
+                                & (model.sync_state == "current"),
+                                1,
+                            ), else_=0)), 0),
+                            func.coalesce(func.sum(case((model.sync_state == "stale", 1), else_=0)), 0),
+                            func.coalesce(func.sum(case((model.sync_state == "orphaned", 1), else_=0)), 0),
+                        ).where(
+                            model.workspace_id == workspace_id,
+                            model.datasource_id == datasource.id,
+                        )
+                    )
+                ).one()
+                counts[total_key] = int(total or 0)
+                counts[queryable_key] = int(queryable or 0)
+                counts["stale_assets"] += int(stale or 0)
+                counts["orphaned_assets"] += int(orphaned or 0)
+
+            recent_statuses = list((await session.execute(
+                select(SemanticQueryRunModel.status)
+                .where(SemanticQueryRunModel.workspace_id == workspace_id)
+                .order_by(SemanticQueryRunModel.created_at.desc())
+                .limit(20)
+            )).scalars())
+            counts["recent_runs"] = len(recent_statuses)
+            counts["recent_success_runs"] = sum(status == "success" for status in recent_statuses)
+
+        return {
+            "datasource": datasource.model_dump(mode="json"),
+            "counts": counts,
+        }
+
+    def build_matching_diagnostics(self, catalog: SemanticCatalog) -> list[dict[str, Any]]:
+        """Report risky business terms without mutating the administrator's catalog."""
+
+        term_refs: dict[str, list[dict[str, Any]]] = {}
+        term_labels: dict[str, str] = {}
+
+        def collect(object_type: str, obj: Any, table_id: int) -> None:
+            values = [(getattr(obj, "business_name", ""), "business_name")]
+            values.extend((item, "synonym") for item in (getattr(obj, "synonyms", []) or []))
+            seen: set[str] = set()
+            for value, source in values:
+                normalized = _normalize_term(value)
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                term_labels.setdefault(normalized, str(value))
+                term_refs.setdefault(normalized, []).append({
+                    "object_type": object_type,
+                    "object_id": int(obj.id),
+                    "table_id": int(table_id),
+                    "business_name": str(getattr(obj, "business_name", "") or ""),
+                    "source": source,
+                })
+
+        for table in catalog.tables:
+            if _is_active_semantic_table(table):
+                collect("table", table, table.id)
+        for column in catalog.columns:
+            if _is_active_semantic_column(column, catalog):
+                collect("column", column, column.table_id)
+        for metric in catalog.metrics:
+            if _is_active_semantic_metric(metric, catalog):
+                collect("metric", metric, metric.table_id)
+
+        diagnostics: list[dict[str, Any]] = []
+        for normalized, refs in sorted(term_refs.items()):
+            label = term_labels[normalized]
+            han_length = len(re.findall(r"[\u4e00-\u9fff]", normalized))
+            table_ids = {int(item["table_id"]) for item in refs}
+            if (han_length and han_length <= 2) or len(table_ids) >= 3:
+                diagnostics.append({
+                    "type": "generic_term",
+                    "severity": "warning",
+                    "term": label,
+                    "objects": refs,
+                })
+            unique_objects = {(item["object_type"], item["object_id"]) for item in refs}
+            if len(table_ids) > 1 and len(unique_objects) > 1:
+                diagnostics.append({
+                    "type": "duplicate_term",
+                    "severity": "warning",
+                    "term": label,
+                    "objects": refs,
+                })
+        return diagnostics
 
     async def scan_workspace_database(self, workspace_id: str, admin_user_id: str) -> dict[str, Any]:
         config = await get_workspace_db_config_async(workspace_id)
@@ -1234,7 +1401,12 @@ class SemanticQueryService:
                 retryable=False,
             )
 
-        engine = create_engine(config.get_connection_url(), pool_pre_ping=True, pool_size=1)
+        connection_url = config.get_connection_url()
+        engine = create_mysql_engine(
+            connection_url,
+            pool_pre_ping=True,
+            pool_size=1,
+        )
         try:
             inspector = inspect(engine)
             table_names = inspector.get_table_names()
@@ -1661,6 +1833,63 @@ class SemanticQueryService:
                 count += 1
 
         return {"suggestion_count": count}
+
+    async def list_table_business_suggestions(
+        self,
+        workspace_id: str,
+        table_id: int,
+    ) -> list[dict[str, Any]]:
+        """List pending table/column suggestions without a workspace-wide cap."""
+        datasource = await self.get_active_datasource(workspace_id)
+        if not datasource:
+            raise SemanticQueryError("datasource_missing", "请先扫描数据库生成语义数据源")
+
+        db_manager = get_async_db_manager()
+        async with db_manager.get_session() as session:
+            table = (await session.execute(select(SemanticTableModel.id).where(
+                SemanticTableModel.id == table_id,
+                SemanticTableModel.workspace_id == workspace_id,
+                SemanticTableModel.datasource_id == datasource.id,
+            ))).scalar_one_or_none()
+            if table is None:
+                raise SemanticQueryError("not_found", "语义表不存在或不属于当前工作区")
+
+            rows = list((await session.execute(
+                select(SemanticBusinessSuggestionModel)
+                .outerjoin(
+                    SemanticColumnModel,
+                    and_(
+                        SemanticBusinessSuggestionModel.object_type == "column",
+                        SemanticColumnModel.id == SemanticBusinessSuggestionModel.object_id,
+                        SemanticColumnModel.workspace_id == workspace_id,
+                        SemanticColumnModel.datasource_id == datasource.id,
+                    ),
+                )
+                .where(
+                    SemanticBusinessSuggestionModel.workspace_id == workspace_id,
+                    SemanticBusinessSuggestionModel.datasource_id == datasource.id,
+                    SemanticBusinessSuggestionModel.status == "pending",
+                    or_(
+                        and_(
+                            SemanticBusinessSuggestionModel.object_type == "table",
+                            SemanticBusinessSuggestionModel.object_id == table_id,
+                        ),
+                        and_(
+                            SemanticBusinessSuggestionModel.object_type == "column",
+                            SemanticColumnModel.table_id == table_id,
+                        ),
+                    ),
+                )
+                .order_by(
+                    SemanticBusinessSuggestionModel.confidence.desc(),
+                    SemanticBusinessSuggestionModel.updated_at.desc(),
+                )
+            )).scalars().all())
+
+        return [
+            SemanticBusinessSuggestion.from_orm(row).model_dump(mode="json")
+            for row in rows
+        ]
 
     async def _latest_column_profile_summaries(
         self,
@@ -2489,16 +2718,72 @@ class SemanticQueryService:
             await session.refresh(rel)
             return SemanticRelationship.from_orm(rel).model_dump(mode="json")
 
+    @staticmethod
+    def _merge_validated_intent_hint(
+        current: IntentQuery,
+        raw_hint: dict[str, Any],
+    ) -> IntentQuery:
+        """Merge an already validated example blueprint into current intent.
+
+        The stored blueprint wins for the query shape. Explicit filters and time
+        expressions from the current utterance are retained. Every referenced
+        object is resolved and permission-checked later by ``resolve_plan``.
+        """
+
+        try:
+            hint = IntentQuery.model_validate(raw_hint)
+        except Exception as exc:  # noqa: BLE001 - persisted data may be stale/corrupt
+            raise SemanticQueryError(
+                "sql_example_intent_invalid",
+                "SQL 示例的结构化查询口径已失效，请重新校验该示例",
+                retryable=False,
+                safe_to_fallback=False,
+            ) from exc
+
+        merged = hint.model_copy(deep=True)
+        merged.tables = list(dict.fromkeys(hint.tables or current.tables))
+        merged.metrics = list(dict.fromkeys(hint.metrics or current.metrics))
+        merged.dimensions = list(dict.fromkeys(hint.dimensions or current.dimensions))
+        merged.explicit_dimensions = (
+            list(dict.fromkeys(hint.explicit_dimensions or hint.dimensions))
+            if (hint.explicit_dimensions is not None or hint.dimensions)
+            else current.explicit_dimensions
+        )
+
+        # Dynamic values have already been safely applied to ``hint`` by the
+        # private-example service. Do not append model-inferred filters here:
+        # doing so can silently change an exact equality into a fuzzy match or
+        # introduce dimensions that were absent from the validated SQL.
+        merged.filters = [dict(item) for item in hint.filters]
+        merged.time_range = hint.time_range or current.time_range
+        merged.order_by = list(hint.order_by or current.order_by)
+        merged.limit = max(1, int(hint.limit or current.limit))
+        merged.confidence = max(float(current.confidence or 0), float(hint.confidence or 0), 0.85)
+        merged.selected_time_column_id = hint.selected_time_column_id or current.selected_time_column_id
+
+        clarification_items = list(dict.fromkeys([*hint.clarification_items, *current.clarification_items]))
+        if merged.metrics:
+            clarification_items = [item for item in clarification_items if item != "缺少已确认指标"]
+        if merged.dimensions:
+            clarification_items = [item for item in clarification_items if item != "缺少排行维度"]
+        if merged.time_range:
+            clarification_items = [item for item in clarification_items if item != "缺少时间范围"]
+        merged.clarification_items = clarification_items
+        merged.matching_trace = [*hint.matching_trace, *current.matching_trace]
+        return merged
+
     async def execute_semantic_query(
         self,
         *,
         question: str,
+        context_hint: Optional[str] = None,
         user_id: str,
         workspace_id: str,
         session_id: str = "",
         force_enabled: bool = False,
         expected_limit: Optional[int] = None,
         semantic_clarification: Optional[dict[str, Any]] = None,
+        _validated_intent_hint: Optional[dict[str, Any]] = None,
     ) -> SemanticExecutionResult:
         started = time.perf_counter()
         run_id = None
@@ -2533,8 +2818,40 @@ class SemanticQueryService:
                 catalog.datasource.id,
                 user_access,
             )
-            intent = await self.extract_intent_hybrid(question, catalog)
+            try:
+                intent = await self.extract_intent_hybrid(
+                    question,
+                    catalog,
+                    context_hint=context_hint,
+                    semantic_clarification=semantic_clarification,
+                )
+            except SemanticQueryError as exc:
+                clarification = self._clarification_from_error(
+                    exc,
+                    catalog,
+                    IntentQuery(),
+                    user_access,
+                )
+                if clarification:
+                    clarification = self._carry_forward_metric_selections(
+                        clarification,
+                        semantic_clarification,
+                    )
+                    raise SemanticQueryError(
+                        "semantic_clarification_required",
+                        clarification.message,
+                        retryable=False,
+                        safe_to_fallback=False,
+                        details={"clarification": clarification.model_dump(mode="json")},
+                    ) from exc
+                raise
             intent = self._apply_semantic_clarification(intent, catalog, semantic_clarification)
+            if _validated_intent_hint:
+                # This internal-only input is produced from an account-owned SQL
+                # example after save-time validation.  It supplies query shape,
+                # never SQL text, and still goes through the ordinary permission
+                # resolver, row-scope injection and safe SQL compiler below.
+                intent = self._merge_validated_intent_hint(intent, _validated_intent_hint)
             try:
                 plan = self.resolve_plan(intent, catalog, user_access)
                 plan.sql = self.compile_sql(plan, catalog)
@@ -2610,6 +2927,7 @@ class SemanticQueryService:
                 diagnostics,
             )
             execution_ms = int((time.perf_counter() - started) * 1000)
+            public_intent = intent.model_dump(mode="json")
             run_id = await self.record_query_run(
                 workspace_id=workspace_id,
                 user_id=user_id,
@@ -2619,7 +2937,7 @@ class SemanticQueryService:
                 fallback_used=False,
                 status="success",
                 error_type=None,
-                intent=intent.model_dump(mode="json"),
+                intent={**public_intent, "matching_trace": intent.matching_trace},
                 plan={**plan.model_dump(mode="json"), "diagnostics": diagnostics},
                 sql=plan.sql,
                 referenced_tables=plan.referenced_tables,
@@ -2629,7 +2947,7 @@ class SemanticQueryService:
             return SemanticExecutionResult(
                 success=True,
                 sql=plan.sql,
-                intent=intent.model_dump(mode="json"),
+                intent=public_intent,
                 plan=plan.model_dump(mode="json"),
                 data=data,
                 columns=columns,
@@ -2713,20 +3031,462 @@ class SemanticQueryService:
         value = re.sub(r"^\s*SQL\s*:\s*", "", value, flags=re.I).strip()
         return value.rstrip(";")
 
-    async def extract_intent_hybrid(self, question: str, catalog: SemanticCatalog) -> IntentQuery:
-        rule_intent = self.extract_intent(question, catalog)
-        if not self._should_use_llm_intent(question, rule_intent):
+    async def extract_intent_hybrid(
+        self,
+        question: str,
+        catalog: SemanticCatalog,
+        *,
+        context_hint: Optional[str] = None,
+        semantic_clarification: Optional[dict[str, Any]] = None,
+    ) -> IntentQuery:
+        metric_selections = self._metric_selections_from_clarification(semantic_clarification)
+        semantic_question = self._semantic_request_text(question)
+        yearless_month = self._extract_yearless_month(semantic_question)
+        selected_time_range = self._time_range_from_clarification(semantic_clarification)
+        if yearless_month and not selected_time_range:
+            base_intent = self.extract_intent(
+                question,
+                catalog,
+                metric_selections=metric_selections,
+            )
+            current_year = datetime.now().year
+            clarification = SemanticClarification(
+                kind="time_year_missing",
+                message=(
+                    f"你说的“{yearless_month}月”没有指定年份。"
+                    "请选择年份，或直接输入完整时间，例如“2025年3月”。"
+                ),
+                options=[
+                    SemanticClarificationOption(
+                        id=f"time_range:{year:04d}-{yearless_month:02d}",
+                        label=f"{year}年{yearless_month}月",
+                        selection_patch={
+                            "base_intent": base_intent.model_dump(mode="json"),
+                            "intent_patch": {
+                                "time_range": f"{year:04d}-{yearless_month:02d}",
+                            },
+                        },
+                    )
+                    for year in range(current_year, current_year - 3, -1)
+                ],
+                original_intent=base_intent.model_dump(mode="json"),
+            )
+            raise SemanticQueryError(
+                "time_year_missing",
+                clarification.message,
+                retryable=False,
+                safe_to_fallback=False,
+                details={"clarification": clarification.model_dump(mode="json")},
+            )
+        hint = str(context_hint or "").strip()
+        if not hint or _normalize_term(hint) == _normalize_term(question):
+            return await self._extract_intent_hybrid_single(
+                question,
+                catalog,
+                metric_selections=metric_selections,
+            )
+        # The raw utterance is the authority boundary.  When contextual input
+        # exists, keep its explicit objects deterministic instead of allowing
+        # an LLM to infer objects that only occur in the Planner envelope.
+        primary = self.extract_intent(question, catalog, metric_selections=metric_selections)
+        context_intent = await self._extract_intent_hybrid_single(
+            hint,
+            catalog,
+            metric_selections=metric_selections,
+        )
+        return self._merge_context_intent(question, primary, context_intent)
+
+    async def _extract_intent_hybrid_single(
+        self,
+        question: str,
+        catalog: SemanticCatalog,
+        *,
+        metric_selections: Optional[list[tuple[int, str]]] = None,
+    ) -> IntentQuery:
+        semantic_question = self._semantic_request_text(question)
+        rule_intent = self.extract_intent(
+            question,
+            catalog,
+            metric_selections=metric_selections,
+        )
+        if not self._should_use_llm_intent(semantic_question, rule_intent):
             return rule_intent
         try:
-            llm_payload = await self._extract_intent_with_llm(question, catalog, rule_intent)
+            llm_payload = await self._extract_intent_with_llm(semantic_question, catalog, rule_intent)
             merged = self._merge_llm_intent(rule_intent, llm_payload, catalog)
-            return self._refine_business_intent(question, merged)
+            return self._refine_business_intent(semantic_question, merged)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Semantic intent LLM fallback failed: %s", exc)
             return rule_intent
 
-    def extract_intent(self, question: str, catalog: SemanticCatalog) -> IntentQuery:
-        text = str(question or "")
+    @staticmethod
+    def _metric_selections_from_clarification(
+        semantic_clarification: Optional[dict[str, Any]],
+    ) -> list[tuple[int, str]]:
+        if not isinstance(semantic_clarification, dict):
+            return []
+        patch = semantic_clarification.get("selection_patch")
+        if not isinstance(patch, dict):
+            patch = semantic_clarification
+        replacements = [
+            item for item in (patch.get("replace_metrics") or [])
+            if isinstance(item, dict)
+        ]
+        if isinstance(patch.get("replace_metric"), dict):
+            replacements.append(patch["replace_metric"])
+        selections_by_term: dict[str, tuple[int, str]] = {}
+        for replacement in replacements:
+            if not replacement.get("to_id"):
+                continue
+            try:
+                metric_id = int(replacement["to_id"])
+            except (TypeError, ValueError):
+                continue
+            normalized_term = _normalize_term(str(replacement.get("from_name") or ""))
+            selection_key = normalized_term or f"metric:{metric_id}"
+            selections_by_term[selection_key] = (metric_id, normalized_term)
+        return list(selections_by_term.values())
+
+    def _time_range_from_clarification(
+        self,
+        semantic_clarification: Optional[dict[str, Any]],
+    ) -> Optional[str]:
+        if not isinstance(semantic_clarification, dict):
+            return None
+        patch = semantic_clarification.get("selection_patch")
+        if not isinstance(patch, dict):
+            patch = semantic_clarification
+        intent_patch = patch.get("intent_patch")
+        if isinstance(intent_patch, dict):
+            selected = self._normalize_time_range(intent_patch.get("time_range"))
+            if selected:
+                return selected
+        return self._extract_time_range(str(semantic_clarification.get("free_text") or ""))
+
+    def _carry_forward_metric_selections(
+        self,
+        clarification: SemanticClarification,
+        prior_clarification: Optional[dict[str, Any]],
+    ) -> SemanticClarification:
+        if not isinstance(prior_clarification, dict):
+            return clarification
+        prior_patch = prior_clarification.get("selection_patch")
+        if not isinstance(prior_patch, dict):
+            prior_patch = prior_clarification
+        prior_replacements = [
+            dict(item)
+            for item in (prior_patch.get("replace_metrics") or [])
+            if isinstance(item, dict) and item.get("to_id")
+        ]
+        if isinstance(prior_patch.get("replace_metric"), dict):
+            prior_replacements.append(dict(prior_patch["replace_metric"]))
+        if not prior_replacements:
+            return clarification
+
+        data = clarification.model_dump(mode="json")
+        for option in data.get("options") or []:
+            option_patch = dict(option.get("selection_patch") or {})
+            current_replacements = [
+                dict(item)
+                for item in (option_patch.get("replace_metrics") or [])
+                if isinstance(item, dict) and item.get("to_id")
+            ]
+            if isinstance(option_patch.get("replace_metric"), dict):
+                current_replacements.append(dict(option_patch["replace_metric"]))
+            replacements_by_term: dict[str, dict[str, Any]] = {}
+            for replacement in [*prior_replacements, *current_replacements]:
+                normalized_term = _normalize_term(str(replacement.get("from_name") or ""))
+                selection_key = normalized_term or f"metric:{replacement.get('to_id')}"
+                replacements_by_term[selection_key] = replacement
+            option_patch["replace_metrics"] = list(replacements_by_term.values())
+            option_patch.pop("replace_metric", None)
+            option["selection_patch"] = option_patch
+        return SemanticClarification(**data)
+
+    @staticmethod
+    def _has_explicit_query_shape(question: str) -> bool:
+        text = _normalize_term(question)
+        return bool(
+            re.search(r"(top\s*\d+|前\s*\d+|最[高低少差好]|排名|排行)", question, re.I)
+            or any(term in text for term in (
+                "趋势", "按月", "每月", "按日", "每天", "同比", "环比",
+                "对比", "比较", "相比", "分别", "统计", "汇总", "合计", "平均",
+            ))
+        )
+
+    def _merge_context_intent(
+        self,
+        question: str,
+        primary: IntentQuery,
+        context: IntentQuery,
+    ) -> IntentQuery:
+        """Fill omissions from Planner/session context without overriding explicit user intent."""
+
+        primary_has_objects = bool(primary.metrics or primary.dimensions or primary.tables or primary.filters)
+        query_type = primary.query_type if self._has_explicit_query_shape(question) else context.query_type
+        metrics = primary.metrics or context.metrics
+        # A metric named in the raw utterance defines a complete aggregate
+        # target. Planner wording such as "销售总金额" must not contribute
+        # generic amount columns as grouping dimensions.
+        dimensions = primary.dimensions or ([] if primary.metrics else context.dimensions)
+        tables = primary.tables or ([] if primary.metrics or primary.dimensions else context.tables)
+        explicit_dimensions = list(primary.explicit_dimensions or [])
+        if not primary_has_objects:
+            explicit_dimensions = list(context.explicit_dimensions or [])
+
+        primary_filter_fields = {
+            _normalize_term(str(item.get("field") or ""))
+            for item in primary.filters
+            if isinstance(item, dict)
+        }
+        filters = list(primary.filters)
+        filters.extend(
+            item for item in context.filters
+            if isinstance(item, dict)
+            and _normalize_term(str(item.get("field") or "")) not in primary_filter_fields
+        )
+        time_range = primary.time_range or context.time_range
+        order_by = primary.order_by or context.order_by
+        clarification_items = list(dict.fromkeys(primary.clarification_items + context.clarification_items))
+        if metrics:
+            clarification_items = [item for item in clarification_items if item != "缺少已确认指标"]
+        if dimensions:
+            clarification_items = [item for item in clarification_items if item != "缺少排行维度"]
+        if time_range:
+            clarification_items = [item for item in clarification_items if item != "缺少时间范围"]
+        return IntentQuery(
+            query_type=query_type,
+            tables=list(dict.fromkeys(tables)),
+            metrics=list(dict.fromkeys(metrics)),
+            dimensions=list(dict.fromkeys(dimensions)),
+            explicit_dimensions=list(dict.fromkeys(explicit_dimensions)),
+            filters=filters,
+            time_range=time_range,
+            order_by=order_by,
+            limit=primary.limit if primary.limit != self.DEFAULT_LIMIT else context.limit,
+            confidence=max(primary.confidence, context.confidence),
+            clarification_items=clarification_items,
+            selected_time_column_id=primary.selected_time_column_id or context.selected_time_column_id,
+            matching_trace=list(primary.matching_trace) + list(context.matching_trace),
+        )
+
+    @staticmethod
+    def _match_sort_key(item: _SemanticMatch) -> tuple[int, int, float, int]:
+        return (item.source_rank, -len(_normalize_term(item.term)), -item.confidence, item.object_id)
+
+    @staticmethod
+    def _term_is_generic(term: str, matches: list[_SemanticMatch]) -> bool:
+        normalized = _normalize_term(term)
+        han_length = len(re.findall(r"[\u4e00-\u9fff]", normalized))
+        shared_tables = {
+            item.table_id
+            for item in matches
+            if _normalize_term(item.term) == normalized and item.table_id
+        }
+        return bool((han_length and han_length <= 2) or len(shared_tables) > 1)
+
+    def _match_semantic_objects(
+        self,
+        text: str,
+        catalog: SemanticCatalog,
+        *,
+        query_type: QueryType,
+    ) -> list[_SemanticMatch]:
+        normalized_text = _normalize_term(text)
+        output: dict[tuple[str, int, int, int], _SemanticMatch] = {}
+
+        def add_match(
+            *,
+            object_type: Literal["table", "column", "metric"],
+            object_id: int,
+            output_name: str,
+            table_id: int,
+            term: str,
+            source: Literal["business_name", "technical_name", "synonym", "loose_table"],
+            source_rank: int,
+            confidence: Optional[float],
+        ) -> None:
+            normalized_term = _normalize_term(term)
+            if not normalized_term:
+                return
+            start = normalized_text.find(normalized_term)
+            while start >= 0:
+                candidate = _SemanticMatch(
+                    object_type=object_type,
+                    object_id=int(object_id),
+                    output_name=output_name,
+                    table_id=int(table_id),
+                    term=term,
+                    start=start,
+                    end=start + len(normalized_term),
+                    source=source,
+                    source_rank=source_rank,
+                    confidence=float(confidence or 0.0),
+                )
+                key = (object_type, int(object_id), candidate.start, candidate.end)
+                previous = output.get(key)
+                if previous is None or self._match_sort_key(candidate) < self._match_sort_key(previous):
+                    output[key] = candidate
+                start = normalized_text.find(normalized_term, start + 1)
+
+        for metric in catalog.metrics:
+            if not _is_active_semantic_metric(metric, catalog):
+                continue
+            add_match(object_type="metric", object_id=metric.id, output_name=metric.name, table_id=metric.table_id, term=metric.business_name, source="business_name", source_rank=0, confidence=metric.confidence)
+            add_match(object_type="metric", object_id=metric.id, output_name=metric.name, table_id=metric.table_id, term=metric.name, source="technical_name", source_rank=1, confidence=metric.confidence)
+            for synonym in _terms_for(synonyms=metric.synonyms):
+                add_match(object_type="metric", object_id=metric.id, output_name=metric.name, table_id=metric.table_id, term=synonym, source="synonym", source_rank=2, confidence=metric.confidence)
+
+        for column in catalog.columns:
+            if not _is_active_semantic_column(column, catalog):
+                continue
+            add_match(object_type="column", object_id=column.id, output_name=column.business_name, table_id=column.table_id, term=column.business_name, source="business_name", source_rank=0, confidence=column.confidence)
+            add_match(object_type="column", object_id=column.id, output_name=column.business_name, table_id=column.table_id, term=column.physical_name, source="technical_name", source_rank=1, confidence=column.confidence)
+            for synonym in _terms_for(synonyms=column.synonyms):
+                add_match(object_type="column", object_id=column.id, output_name=column.business_name, table_id=column.table_id, term=synonym, source="synonym", source_rank=2, confidence=column.confidence)
+
+        for table in catalog.tables:
+            if not _is_active_semantic_table(table):
+                continue
+            add_match(object_type="table", object_id=table.id, output_name=table.business_name, table_id=table.id, term=table.business_name, source="business_name", source_rank=0, confidence=table.confidence)
+            add_match(object_type="table", object_id=table.id, output_name=table.business_name, table_id=table.id, term=table.physical_name, source="technical_name", source_rank=1, confidence=table.confidence)
+            for synonym in _terms_for(synonyms=table.synonyms):
+                add_match(object_type="table", object_id=table.id, output_name=table.business_name, table_id=table.id, term=synonym, source="synonym", source_rank=2, confidence=table.confidence)
+            for term in _terms_for(table.physical_name, table.business_name, synonyms=table.synonyms):
+                compact = _compact_semantic_term(term)
+                if compact and compact != _normalize_term(term):
+                    add_match(object_type="table", object_id=table.id, output_name=table.business_name, table_id=table.id, term=compact, source="loose_table", source_rank=3, confidence=table.confidence)
+        return list(output.values())
+
+    def _best_metric_matches(
+        self,
+        matches: list[_SemanticMatch],
+        metric_selections: Optional[list[tuple[int, str]]] = None,
+    ) -> list[_SemanticMatch]:
+        candidates = sorted(
+            (item for item in matches if item.object_type == "metric"),
+            key=lambda item: (item.start, item.end, *self._match_sort_key(item)),
+        )
+        groups: list[list[_SemanticMatch]] = []
+        for candidate in candidates:
+            overlapping = next(
+                (group for group in groups if any(candidate.start < item.end and item.start < candidate.end for item in group)),
+                None,
+            )
+            if overlapping is None:
+                groups.append([candidate])
+            else:
+                overlapping.append(candidate)
+
+        selected: list[_SemanticMatch] = []
+        for group in groups:
+            best_key = min(self._match_sort_key(item)[:3] for item in group)
+            best = [item for item in group if self._match_sort_key(item)[:3] == best_key]
+            distinct = {(item.object_id, item.table_id) for item in best}
+            if len(distinct) > 1:
+                matched_terms = {_normalize_term(item.term) for item in best}
+                selected_matches: list[_SemanticMatch] = []
+                for selected_metric_id, selected_term in metric_selections or []:
+                    if selected_term and selected_term not in matched_terms:
+                        continue
+                    selected_matches = [
+                        item for item in best
+                        if item.object_id == selected_metric_id
+                    ]
+                    if selected_matches:
+                        break
+                if selected_matches:
+                    selected.append(sorted(selected_matches, key=self._match_sort_key)[0])
+                    continue
+                raise SemanticQueryError(
+                    "metric_ambiguous",
+                    f"指标存在多个同级候选: {best[0].term}",
+                    retryable=False,
+                    safe_to_fallback=False,
+                    details={
+                        "candidate_metric_ids": sorted({item.object_id for item in best}),
+                        "matched_term": best[0].term,
+                    },
+                )
+            selected.append(sorted(best, key=self._match_sort_key)[0])
+        return selected
+
+    def _apply_metric_selection_to_names(
+        self,
+        metrics: list[str],
+        matches: list[_SemanticMatch],
+        metric_selections: Optional[list[tuple[int, str]]],
+    ) -> list[str]:
+        output = list(metrics)
+        for selected_metric_id, selected_term in metric_selections or []:
+            term_matches = [
+                item
+                for item in matches
+                if item.object_type == "metric"
+                and (not selected_term or _normalize_term(item.term) == selected_term)
+            ]
+            selected_matches = [
+                item for item in term_matches
+                if item.object_id == selected_metric_id
+            ]
+            if not selected_matches:
+                continue
+            selected_name = sorted(selected_matches, key=self._match_sort_key)[0].output_name
+            candidate_names = {item.output_name for item in term_matches}
+            candidate_indexes = [
+                index for index, name in enumerate(output)
+                if name in candidate_names
+            ]
+            insert_at = candidate_indexes[0] if candidate_indexes else len(output)
+            output = [name for name in output if name not in candidate_names]
+            output.insert(min(insert_at, len(output)), selected_name)
+        return list(dict.fromkeys(output))
+
+    def _best_column_matches(
+        self,
+        matches: list[_SemanticMatch],
+        *,
+        metric_spans: list[tuple[int, int, int]],
+        anchored_table_ids: set[int],
+        analytical: bool,
+    ) -> list[_SemanticMatch]:
+        candidates = [item for item in matches if item.object_type == "column"]
+        candidates = [
+            item for item in candidates
+            if not any(
+                item.start >= start and item.end <= end and item.source_rank >= metric_rank
+                for start, end, metric_rank in metric_spans
+            )
+        ]
+        selected: list[_SemanticMatch] = []
+        grouped: dict[tuple[int, int, str], list[_SemanticMatch]] = {}
+        for item in candidates:
+            grouped.setdefault((item.start, item.end, _normalize_term(item.term)), []).append(item)
+        for group in grouped.values():
+            generic = self._term_is_generic(group[0].term, matches)
+            scoped = [item for item in group if item.table_id in anchored_table_ids]
+            if anchored_table_ids and (generic or analytical):
+                group = scoped
+            elif generic and not anchored_table_ids:
+                # Keep the semantic field name for a follow-up such as “按客户呢”,
+                # but do not return multiple cross-table candidates.
+                group = sorted(group, key=self._match_sort_key)[:1]
+            if not group:
+                continue
+            selected.append(sorted(group, key=self._match_sort_key)[0])
+        selected.sort(key=lambda item: (item.start, *self._match_sort_key(item)))
+        return selected
+
+    def extract_intent(
+        self,
+        question: str,
+        catalog: SemanticCatalog,
+        *,
+        metric_selections: Optional[list[tuple[int, str]]] = None,
+    ) -> IntentQuery:
+        raw_text = str(question or "")
+        current_question = self._current_question_text(raw_text)
+        text = self._semantic_request_text(raw_text)
         normalized = _normalize_term(text)
         query_type: QueryType = "detail"
         if re.search(r"(top\s*\d+|前\s*\d+|前[一二三四五六七八九十]+|最[高低少差好]|排名|排行)", text, re.I):
@@ -2739,45 +3499,37 @@ class SemanticQueryService:
             query_type = "aggregate"
 
         limit = self._extract_limit(text, default=10 if query_type == "topn" else self.DEFAULT_LIMIT)
-        metrics = [
-            metric.name
-            for metric in catalog.metrics
-            if _is_active_semantic_metric(metric, catalog)
-            and _contains_term(text, _terms_for(metric.name, metric.business_name, synonyms=metric.synonyms))
-        ]
-        dimensions = [
-            column.business_name
-            for column in catalog.columns
-            if _is_active_semantic_column(column, catalog)
-            and _contains_term(text, _terms_for(column.physical_name, column.business_name, synonyms=column.synonyms))
-        ]
-        if metrics:
-            metric_terms = {
-                _normalize_term(term)
-                for metric in catalog.metrics
-                if metric.name in metrics
-                for term in _terms_for(metric.name, metric.business_name, synonyms=metric.synonyms)
-            }
-            dimensions = [
-                name
-                for name in dimensions
-                if _normalize_term(name) not in metric_terms
-            ]
-        tables = [
-            table.business_name
-            for table in catalog.tables
-            if table.status == "confirmed"
-            and table.is_queryable
-            and _contains_loose_term(text, _terms_for(table.physical_name, table.business_name, synonyms=table.synonyms))
-        ]
-        if not dimensions and not tables:
-            tables = [
-                table.business_name
-                for table in catalog.tables
-                if table.status == "confirmed"
-                and table.is_queryable
-                and _contains_term(text, _terms_for(table.physical_name, table.business_name, synonyms=table.synonyms))
-            ]
+        matches = self._match_semantic_objects(text, catalog, query_type=query_type)
+        explicit_matches = self._match_semantic_objects(current_question, catalog, query_type=query_type)
+        metric_matches = self._best_metric_matches(matches, metric_selections)
+        metric_spans = [(item.start, item.end, item.source_rank) for item in metric_matches]
+        metric_table_ids = {item.table_id for item in metric_matches}
+        column_matches = self._best_column_matches(
+            matches,
+            metric_spans=metric_spans,
+            anchored_table_ids=metric_table_ids,
+            analytical=query_type in {"aggregate", "topn", "trend", "compare"},
+        )
+        explicit_column_matches = self._best_column_matches(
+            explicit_matches,
+            metric_spans=[
+                (item.start, item.end, item.source_rank)
+                for item in self._best_metric_matches(explicit_matches, metric_selections)
+            ],
+            anchored_table_ids=metric_table_ids,
+            analytical=query_type in {"aggregate", "topn", "trend", "compare"},
+        )
+        metrics = list(dict.fromkeys(item.output_name for item in metric_matches))
+        dimensions = list(dict.fromkeys(item.output_name for item in column_matches))
+        explicit_dimensions = list(dict.fromkeys(item.output_name for item in explicit_column_matches))
+        table_matches = [item for item in matches if item.object_type == "table"]
+        if metric_table_ids and query_type in {"aggregate", "topn", "trend", "compare"}:
+            table_matches = [item for item in table_matches if item.table_id in metric_table_ids]
+        tables = list(dict.fromkeys(
+            item.output_name
+            for item in sorted(table_matches, key=self._match_sort_key)
+            if item.source != "loose_table" or not (metrics or dimensions)
+        ))
 
         time_range = self._extract_time_range(text)
         filters = self._extract_rule_filters(text, catalog, tables, dimensions)
@@ -2797,6 +3549,11 @@ class SemanticQueryService:
             filters=filters,
             time_range=time_range,
             order_by=order_by,
+        )
+        metrics = self._apply_metric_selection_to_names(
+            metrics,
+            matches,
+            metric_selections,
         )
 
         confidence = 0.82 if metrics or dimensions or tables or filters else 0.5
@@ -2818,12 +3575,26 @@ class SemanticQueryService:
             tables=tables,
             metrics=metrics,
             dimensions=dimensions,
+            explicit_dimensions=list(dict.fromkeys(explicit_dimensions)),
             filters=filters,
             time_range=time_range,
             order_by=order_by,
             limit=limit,
             confidence=confidence,
             clarification_items=clarification_items,
+            matching_trace=[
+                {
+                    "object_type": item.object_type,
+                    "object_id": item.object_id,
+                    "table_id": item.table_id,
+                    "term": item.term,
+                    "span": [item.start, item.end],
+                    "source": item.source,
+                    "source_rank": item.source_rank,
+                    "confidence": item.confidence,
+                }
+                for item in sorted(matches, key=lambda item: (item.start, item.end, *self._match_sort_key(item)))
+            ],
         )
 
     def _refine_business_intent(self, question: str, intent: IntentQuery) -> IntentQuery:
@@ -2854,12 +3625,14 @@ class SemanticQueryService:
             tables=tables,
             metrics=metrics,
             dimensions=dimensions,
+            explicit_dimensions=intent.explicit_dimensions,
             filters=filters,
             time_range=time_range,
             order_by=order_by,
             limit=intent.limit,
             confidence=intent.confidence,
             clarification_items=clarification_items,
+            matching_trace=intent.matching_trace,
         )
 
     def _should_use_llm_intent(self, question: str, intent: IntentQuery) -> bool:
@@ -3036,6 +3809,7 @@ class SemanticQueryService:
             tables=tables,
             metrics=metrics,
             dimensions=dimensions,
+            explicit_dimensions=rule_intent.explicit_dimensions,
             filters=filters,
             time_range=time_range,
             order_by=rule_intent.order_by,
@@ -3043,6 +3817,7 @@ class SemanticQueryService:
             confidence=float(confidence),
             clarification_items=[str(item) for item in clarification_items if item],
             selected_time_column_id=rule_intent.selected_time_column_id,
+            matching_trace=rule_intent.matching_trace,
         )
 
     def _valid_names(self, values: Any, catalog: SemanticCatalog, object_type: str) -> list[str]:
@@ -3111,7 +3886,13 @@ class SemanticQueryService:
         time_range: Optional[str],
         order_by: list[dict[str, str]],
     ) -> tuple[QueryType, list[str], list[str], list[str], list[dict[str, Any]], Optional[str], list[dict[str, str]]]:
-        normalized = _normalize_term(text)
+        # Supervisor supplies a context envelope containing instructions,
+        # summaries and prior turns.  Deterministic business keywords must be
+        # evaluated only against the current utterance; otherwise phrases such
+        # as “一次数据查询” accidentally contain “次数” and turn a detail query
+        # into an aggregate query.
+        business_text = self._current_question_text(text)
+        normalized = _normalize_term(business_text)
         tables = list(tables)
         metrics = list(metrics)
         dimensions = list(dimensions)
@@ -3152,6 +3933,18 @@ class SemanticQueryService:
             set_metrics([])
             set_dimensions(["关联主码", "跟进人", "跟进时间", "跟进方式", "跟进内容", "跟进记录详情", "业务类型标识", "下次访问时间"])
             order_by = []
+            # At this point the business table is unambiguous.  Extract the
+            # leading person deterministically instead of relying on the LLM or
+            # the earlier catalog-wide filter pass (which may see many person
+            # columns and deliberately decline to guess).
+            person_value = self._extract_person_value(text)
+            if person_value:
+                filters = [
+                    item
+                    for item in filters
+                    if str(item.get("field") or "") != "跟进人"
+                ]
+                add_filter({"field": "跟进人", "operator": "contains", "value": person_value})
             if "统计" in normalized or "次数" in normalized:
                 query_type = "aggregate"
                 set_metrics(["follow_record_count"])
@@ -3341,22 +4134,18 @@ class SemanticQueryService:
             if not metrics:
                 set_dimensions(["订单号", "客户名称", "制单日期", "交货日期", "完成状态"])
 
-        if "销售订单" in normalized and any(term in normalized for term in ("总金额", "订单数量", "明细数量", "平均单价")):
-            set_tables(["销售订单主表", "clean_jf_sale_order_1"])
-            set_metrics(["sales_amount", "sales_order_count", "sum_clean_jf_sale_order_1_quantity", "avg_unit_price_clean_jf_sale_order_1"])
-            dimensions = []
-
         if "销售" in normalized and "客户" in normalized and query_type == "topn":
-            set_tables(["销售订单主表", "clean_jf_sale_order_1"])
-            set_metrics(["sales_amount", "sales_order_count", "sum_clean_jf_sale_order_1_quantity"])
+            set_tables(["销售订单主表"])
+            if not metrics:
+                set_metrics(["sales_amount"])
             set_dimensions(["客户名称"])
-            order_by = [{"field": "sales_amount", "direction": "desc"}]
+            order_by = [{"field": metrics[0] if metrics else "sales_amount", "direction": "desc"}]
 
         if "销售数量" in normalized and query_type == "topn":
             set_tables(["销售订单主表", "clean_jf_sale_order_1"])
-            set_metrics(["sum_clean_jf_sale_order_1_quantity", "sum_clean_jf_sale_order_1_tax_amount"])
+            set_metrics(["sales_detail_quantity", "sum_clean_jf_sale_order_1_tax_amount"])
             set_dimensions(["product_name", "customer_item_number", "product_model"])
-            order_by = [{"field": "sum_clean_jf_sale_order_1_quantity", "direction": "desc"}]
+            order_by = [{"field": "sales_detail_quantity", "direction": "desc"}]
 
         return (
             query_type,
@@ -3426,11 +4215,61 @@ class SemanticQueryService:
                     return value
         return ""
 
+    @staticmethod
+    def _current_question_text(text: str) -> str:
+        primary = str(text or "").strip()
+        current_question = re.search(
+            r"(?:^|\n)用户当前问题\s*[：:]\s*(?:\r?\n)?([^\r\n]+)",
+            primary,
+        )
+        return current_question.group(1).strip() if current_question else primary
+
+    @classmethod
+    def _semantic_request_text(cls, text: str) -> str:
+        primary = str(text or "").strip()
+        complete_request = re.search(
+            r"(?:^|\n)完整\s*SQL\s*查询需求\s*[：:]\s*(?:\r?\n)?([^\r\n]+)",
+            primary,
+            flags=re.IGNORECASE,
+        )
+        if complete_request:
+            return complete_request.group(1).strip()
+        return cls._current_question_text(primary)
+
     def _extract_person_value(self, text: str) -> str:
+        primary = self._current_question_text(text)
+        # Chat execution wraps the current utterance in a multi-section context
+        # envelope.  Person extraction must use the current utterance rather
+        # than matching a later copy in conversation/SQL context.
+        primary = re.sub(r"^\[Router修复[^\]]*\]\s*", "", primary)
+        primary = re.sub(
+            r"^(?:sql execution failed[，,：:\s]*)?(?:修复后重试[：:\s]*)?",
+            "",
+            primary,
+            flags=re.IGNORECASE,
+        )
+        # Router retries often wrap the original question in phrases such as
+        # “查询数据库中…” or “从数据库里获取…”.  Remove that transport wording
+        # before extracting the person so its final location character is not
+        # mistaken for part of the name (for example, “中张蒙”).
+        primary = re.sub(
+            r"^(?:(?:查询|查看|检索)\s*)?(?:从\s*)?数据库(?:中|内|里)?[，,]?\s*(?:查询|获取|查找|检索)?\s*",
+            "",
+            primary,
+            count=1,
+        )
+        named_person = re.search(
+            r"(?:员工名|员工姓名|跟进人|人员|姓名)\s*(?:为|是|=|等于)?\s*"
+            r"[\"'“”‘’]?([\u4e00-\u9fff]{2,4})[\"'“”‘’]?"
+            r"(?=且|在|于|，|,|\s|$)",
+            primary,
+        )
+        if named_person:
+            return named_person.group(1).strip()
         match = re.search(
             r"(?:分析|查询|查看|统计)?\s*(?:数据库)?\s*(?:获取)?\s*"
             r"([\u4e00-\u9fff]{2,4})\s*(?:在|于)?\s*(?=\d{4}年|\d{4}[-/])",
-            text,
+            primary,
         )
         if match:
             value = match.group(1).strip()
@@ -3537,6 +4376,7 @@ class SemanticQueryService:
                 details={
                     "candidate_column_ids": [item.id for item in best_matches],
                     "scope_table_ids": sorted(scope),
+                    "requested_name": name,
                 },
             )
         return best_matches[0]
@@ -3586,6 +4426,40 @@ class SemanticQueryService:
         if "上月" in text or "上个月" in text:
             return "上月"
         return None
+
+    @staticmethod
+    def _parse_month_token(value: str) -> int:
+        token = str(value or "").strip()
+        if token.isdigit():
+            month_value = int(token)
+            return month_value if 1 <= month_value <= 12 else 0
+        return {
+            "一": 1,
+            "二": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+            "六": 6,
+            "七": 7,
+            "八": 8,
+            "九": 9,
+            "十": 10,
+            "十一": 11,
+            "十二": 12,
+        }.get(token, 0)
+
+    def _extract_yearless_month(self, text: str) -> Optional[int]:
+        value = str(text or "")
+        if not value or self._extract_time_range(value):
+            return None
+        match = re.search(
+            r"(?<!\d)(1[0-2]|0?[1-9]|十一|十二|十|[一二三四五六七八九])\s*月(?:份)?(?!\d)",
+            value,
+        )
+        if not match:
+            return None
+        month_value = self._parse_month_token(match.group(1))
+        return month_value or None
 
     def _normalize_time_range(self, value: Any) -> Optional[str]:
         if value is None:
@@ -3652,12 +4526,54 @@ class SemanticQueryService:
 
         dimension_scope = set(selected_table_ids)
         dimension_columns = []
+        implicit_permission_omissions: list[dict[str, Any]] = []
+        explicit_dimension_names = (
+            intent.dimensions
+            if intent.explicit_dimensions is None
+            else intent.explicit_dimensions
+        )
+        explicit_dimension_keys = {
+            _normalize_term(name)
+            for name in explicit_dimension_names
+            if str(name or "").strip()
+        }
         for name in intent.dimensions:
             column = self._find_column_in_scope(name, catalog, dimension_scope or None)
+            requested_keys = {
+                _normalize_term(value)
+                for value in (name,)
+                if value
+            }
+            is_explicit_dimension = bool(requested_keys & explicit_dimension_keys)
             if not column and dimension_scope:
                 # A dimension outside the metric table is a multi-table request;
                 # resolve it globally so the confirmed Join graph must authorize it.
+                if intent.query_type in {"aggregate", "topn", "trend", "compare"} and not is_explicit_dimension:
+                    continue
                 column = self._find_column_in_scope(name, catalog, None)
+            if column and intent.query_type == "detail" and intent.explicit_dimensions is not None:
+                column_keys = {
+                    _normalize_term(value)
+                    for value in (column.business_name, column.physical_name, *column.synonyms)
+                    if value
+                }
+                is_explicit = bool(column_keys & explicit_dimension_keys)
+                if not is_explicit:
+                    decision = get_semantic_access_policy_service().check_object_access(
+                        "column",
+                        column,
+                        user_access,
+                    )
+                    if not decision.get("allowed"):
+                        implicit_permission_omissions.append(
+                            {
+                                "object_type": "column",
+                                "object_id": int(column.id),
+                                "action": "omit_implicit_hidden",
+                                "policy_ids": decision.get("policy_ids") or [],
+                            }
+                        )
+                        continue
             dimension_columns.append(column)
         dimension_columns = [column for column in dimension_columns if column]
         for column in dimension_columns:
@@ -3705,7 +4621,14 @@ class SemanticQueryService:
             selected_metric_ids,
             catalog,
         )
+        self._check_row_scope_conflicts(
+            selected_table_ids=selected_table_ids,
+            intent=intent,
+            catalog=catalog,
+            user_access=user_access,
+        )
         permission_actions = self._check_semantic_permissions(objects, user_access, catalog, intent)
+        permission_actions.extend(implicit_permission_omissions)
 
         referenced_tables = [
             catalog.table_by_id[table_id].physical_name
@@ -3724,6 +4647,137 @@ class SemanticQueryService:
             user_access=user_access,
             referenced_tables=sorted(referenced_tables),
         )
+
+    def _check_row_scope_conflicts(
+        self,
+        *,
+        selected_table_ids: set[int],
+        intent: IntentQuery,
+        catalog: SemanticCatalog,
+        user_access: dict[str, Any],
+    ) -> None:
+        """Reject a query when its explicit value is provably outside row scope.
+
+        The SQL predicate remains the enforcement boundary.  This preflight only
+        recognizes simple static ``=``/``IN`` row policies, so it cannot turn an
+        ordinary empty result into a false permission denial.
+        """
+        runtime = user_access.get("semantic_access") or {}
+        if runtime.get("is_admin"):
+            return
+        effects_by_asset = runtime.get("effects_by_asset") or {}
+
+        for filter_item in intent.filters:
+            operator = str(filter_item.get("operator") or "eq").lower()
+            if operator not in {"eq", "contains", "in"}:
+                continue
+            columns = self._filter_columns_for_item(filter_item, catalog, selected_table_ids)
+            if len(columns) != 1:
+                continue
+            column = columns[0]
+            table = catalog.table_by_id.get(column.table_id)
+            if not table:
+                continue
+            table_decision = get_semantic_access_policy_service().check_object_access(
+                "table",
+                table,
+                user_access,
+            )
+            if not table_decision.get("allowed"):
+                continue
+
+            row_effects = [
+                item
+                for item in effects_by_asset.get(f"table:{column.table_id}", [])
+                if item.get("effect_type") == "row_filter"
+            ]
+            visible_effects = [
+                item
+                for item in effects_by_asset.get(f"table:{column.table_id}", [])
+                if item.get("effect_type") == "visible"
+            ]
+            if any(
+                (item.get("condition_json") or {}).get("row_scope", {}).get("type") == "all"
+                for item in visible_effects
+            ):
+                continue
+            if not row_effects:
+                continue
+
+            allowed_values: set[str] = set()
+            fully_understood = True
+            for effect in row_effects:
+                condition = effect.get("condition_json") or {}
+                try:
+                    condition_column_id = int(condition.get("column_id") or 0)
+                except (TypeError, ValueError):
+                    fully_understood = False
+                    break
+                row_operator = str(condition.get("operator") or "").strip().lower()
+                if (
+                    condition_column_id != int(column.id)
+                    or row_operator not in {"=", "in"}
+                    or condition.get("value_source")
+                ):
+                    fully_understood = False
+                    break
+                raw_value = condition.get("value")
+                if row_operator == "in":
+                    values = (
+                        [item.strip() for item in re.split(r"[,，]", raw_value) if item.strip()]
+                        if isinstance(raw_value, str)
+                        else _as_list(raw_value)
+                    )
+                else:
+                    values = [raw_value]
+                normalized = {
+                    str(value).strip().casefold()
+                    for value in values
+                    if value is not None and str(value).strip()
+                }
+                if not normalized:
+                    fully_understood = False
+                    break
+                allowed_values.update(normalized)
+
+            if not fully_understood or not allowed_values:
+                continue
+
+            requested_raw = filter_item.get("values") if operator == "in" else [filter_item.get("value")]
+            requested_values = [
+                str(value).strip()
+                for value in _as_list(requested_raw)
+                if value is not None and str(value).strip()
+            ]
+            if not requested_values:
+                continue
+            requested_normalized = {value.casefold() for value in requested_values}
+            if operator == "contains":
+                has_overlap = any(
+                    requested in allowed
+                    for requested in requested_normalized
+                    for allowed in allowed_values
+                )
+            else:
+                has_overlap = bool(requested_normalized & allowed_values)
+            if has_overlap:
+                continue
+
+            requested_label = "、".join(requested_values)
+            table_label = str(table.business_name or table.physical_name or "相关数据").strip()
+            if table_label.endswith("表"):
+                table_label = table_label[:-1]
+            raise SemanticQueryError(
+                "permission_denied",
+                f"当前用户无权查询“{requested_label}”的{table_label}。",
+                safe_to_fallback=False,
+                details={
+                    "reason": "row_scope_conflict",
+                    "table_id": int(table.id),
+                    "column_id": int(column.id),
+                    "requested_values": requested_values,
+                },
+            )
 
     def compile_sql(self, plan: SemanticPlan, catalog: SemanticCatalog) -> str:
         try:
@@ -3746,6 +4800,19 @@ class SemanticQueryService:
                     safe_to_fallback=True,
                     details=plan.model_dump(mode="json"),
                 ) from exc
+        grain_safe_sql = self._compile_grain_safe_metric_sql(plan, catalog, metric_items)
+        if grain_safe_sql:
+            try:
+                parsed = sqlglot.parse_one(grain_safe_sql, read="mysql")
+                return parsed.sql(dialect="mysql")
+            except Exception as exc:  # noqa: BLE001
+                raise SemanticQueryError(
+                    "sql_compile_failed",
+                    f"跨粒度指标计划编译 SQL 失败: {exc}",
+                    retryable=True,
+                    safe_to_fallback=True,
+                    details=plan.model_dump(mode="json"),
+                ) from exc
         metric_table_id = next((metric.table_id for metric in metric_items if metric.table_id in table_ids), None)
         if metric_table_id is not None:
             table_ids = [metric_table_id, *[table_id for table_id in table_ids if table_id != metric_table_id]]
@@ -3756,30 +4823,63 @@ class SemanticQueryService:
         base_table = tables[0]
         aliases = {base_table.id: "t0"}
         joins = []
-        for idx, rel_id in enumerate(plan.relationship_ids, start=1):
-            rel = next((item for item in self._relationships_for_catalog(catalog) if item.id == rel_id), None)
-            if not rel:
-                continue
-            if rel.left_table_id in aliases and rel.right_table_id not in aliases:
-                aliases[rel.right_table_id] = f"t{idx}"
-                left_alias = aliases[rel.left_table_id]
-                right_alias = aliases[rel.right_table_id]
-                right_table = catalog.table_by_id[rel.right_table_id]
-                left_col = catalog.column_by_id[rel.left_column_id]
-                right_col = catalog.column_by_id[rel.right_column_id]
-            elif rel.right_table_id in aliases and rel.left_table_id not in aliases:
-                aliases[rel.left_table_id] = f"t{idx}"
-                left_alias = aliases[rel.right_table_id]
-                right_alias = aliases[rel.left_table_id]
-                right_table = catalog.table_by_id[rel.left_table_id]
-                left_col = catalog.column_by_id[rel.right_column_id]
-                right_col = catalog.column_by_id[rel.left_column_id]
-            else:
-                continue
-            joins.append(
-                f"JOIN {_quote_ident(right_table.physical_name)} {right_alias} "
-                f"ON {left_alias}.{_quote_ident(left_col.physical_name)} = "
-                f"{right_alias}.{_quote_ident(right_col.physical_name)}"
+        relationships_by_id = {
+            item.id: item for item in self._relationships_for_catalog(catalog)
+        }
+        pending_relationships = [
+            relationships_by_id[rel_id]
+            for rel_id in plan.relationship_ids
+            if rel_id in relationships_by_id
+        ]
+        next_alias_index = 1
+        while pending_relationships:
+            progress = False
+            next_pending = []
+            for rel in pending_relationships:
+                left_in = rel.left_table_id in aliases
+                right_in = rel.right_table_id in aliases
+                if left_in and right_in:
+                    continue
+                if left_in and not right_in:
+                    aliases[rel.right_table_id] = f"t{next_alias_index}"
+                    left_alias = aliases[rel.left_table_id]
+                    right_alias = aliases[rel.right_table_id]
+                    right_table = catalog.table_by_id[rel.right_table_id]
+                    left_col = catalog.column_by_id[rel.left_column_id]
+                    right_col = catalog.column_by_id[rel.right_column_id]
+                elif right_in and not left_in:
+                    aliases[rel.left_table_id] = f"t{next_alias_index}"
+                    left_alias = aliases[rel.right_table_id]
+                    right_alias = aliases[rel.left_table_id]
+                    right_table = catalog.table_by_id[rel.left_table_id]
+                    left_col = catalog.column_by_id[rel.right_column_id]
+                    right_col = catalog.column_by_id[rel.left_column_id]
+                else:
+                    next_pending.append(rel)
+                    continue
+                next_alias_index += 1
+                progress = True
+                joins.append(
+                    f"JOIN {_quote_ident(right_table.physical_name)} {right_alias} "
+                    f"ON {left_alias}.{_quote_ident(left_col.physical_name)} = "
+                    f"{right_alias}.{_quote_ident(right_col.physical_name)}"
+                )
+            if not progress:
+                break
+            pending_relationships = next_pending
+
+        missing_table_ids = sorted(set(table_ids) - set(aliases))
+        if missing_table_ids:
+            raise SemanticQueryError(
+                "semantic_model_incomplete",
+                "已确认 Join 路径无法从查询主表连接所有引用表",
+                retryable=False,
+                safe_to_fallback=False,
+                details={
+                    "base_table_id": base_table.id,
+                    "missing_table_ids": missing_table_ids,
+                    "relationship_ids": plan.relationship_ids,
+                },
             )
 
         compare_sql = self._compile_compare_sql(plan, catalog, aliases, joins, base_table)
@@ -4005,6 +5105,245 @@ class SemanticQueryService:
             "GROUP BY " + ", ".join(group_items),
             f"LIMIT {max(1, min(plan.intent.limit, self.MAX_LIMIT))}",
         ]
+        return "\n".join(sql_parts)
+
+    def _compile_grain_safe_metric_sql(
+        self,
+        plan: SemanticPlan,
+        catalog: SemanticCatalog,
+        metric_items: list[SemanticMetric],
+    ) -> str:
+        """Aggregate each fact grain before combining metrics from multiple tables.
+
+        A direct many-to-one join is safe for a metric on the many side, but it
+        duplicates metrics owned by the one side.  This compiler creates one
+        aggregate subquery per metric table, lets a fact table traverse only
+        towards confirmed parent tables for dimensions/time/filtering, and
+        combines the already-aggregated results afterwards.
+        """
+
+        if plan.intent.query_type not in {"aggregate", "topn"}:
+            return ""
+        metric_table_ids = list(dict.fromkeys(metric.table_id for metric in metric_items))
+        if len(metric_table_ids) <= 1:
+            return ""
+
+        dimensions = [
+            catalog.column_by_id[column_id]
+            for column_id in plan.column_ids
+            if column_id in catalog.column_by_id
+        ]
+        filter_columns = {
+            column.id: column
+            for item in plan.intent.filters
+            for column in self._filter_columns_for_item(item, catalog, set(plan.table_ids))
+        }
+        time_column = (
+            self._select_time_column(set(plan.table_ids), plan.intent, catalog)
+            if plan.intent.time_range
+            else None
+        )
+        relationships = {
+            relationship.id: relationship
+            for relationship in self._relationships_for_catalog(catalog)
+            if relationship.id in set(plan.relationship_ids)
+        }
+
+        # Directed edges describe the only traversal that preserves the metric
+        # table grain.  For many_to_one the many/left side may safely reference
+        # parent/right attributes; the reverse direction would fan out rows.
+        safe_edges: dict[int, list[tuple[int, SemanticRelationship]]] = {}
+        for relationship in relationships.values():
+            relation_type = str(relationship.relationship_type or "").lower()
+            safe_edges.setdefault(relationship.left_table_id, []).append(
+                (relationship.right_table_id, relationship)
+            )
+            if relation_type in {"one_to_one", "1:1", "one-to-one"}:
+                safe_edges.setdefault(relationship.right_table_id, []).append(
+                    (relationship.left_table_id, relationship)
+                )
+
+        metric_groups: list[tuple[int, list[SemanticMetric]]] = []
+        for table_id in metric_table_ids:
+            metric_groups.append((table_id, [metric for metric in metric_items if metric.table_id == table_id]))
+
+        subqueries: list[dict[str, Any]] = []
+        for index, (metric_table_id, metrics) in enumerate(metric_groups):
+            required_table_ids = {metric_table_id}
+            required_table_ids.update(column.table_id for column in dimensions)
+            required_table_ids.update(column.table_id for column in filter_columns.values())
+            if time_column:
+                required_table_ids.add(time_column.table_id)
+
+            aliases = {metric_table_id: "m0"}
+            joins: list[str] = []
+            queue = [metric_table_id]
+            while queue:
+                current = queue.pop(0)
+                for target, relationship in safe_edges.get(current, []):
+                    if target in aliases:
+                        continue
+                    aliases[target] = f"m{len(aliases)}"
+                    queue.append(target)
+                    current_alias = aliases[current]
+                    target_alias = aliases[target]
+                    if relationship.left_table_id == current:
+                        current_column = catalog.column_by_id[relationship.left_column_id]
+                        target_column = catalog.column_by_id[relationship.right_column_id]
+                    else:
+                        current_column = catalog.column_by_id[relationship.right_column_id]
+                        target_column = catalog.column_by_id[relationship.left_column_id]
+                    target_table = catalog.table_by_id[target]
+                    joins.append(
+                        f"JOIN {_quote_ident(target_table.physical_name)} {target_alias} "
+                        f"ON {current_alias}.{_quote_ident(current_column.physical_name)} = "
+                        f"{target_alias}.{_quote_ident(target_column.physical_name)}"
+                    )
+
+            missing_required = sorted(required_table_ids - set(aliases))
+            if missing_required:
+                raise SemanticQueryError(
+                    "metric_grain_conflict",
+                    "跨表指标无法在不重复聚合的前提下应用当前维度或筛选条件",
+                    retryable=False,
+                    safe_to_fallback=False,
+                    details={
+                        "metric_table_id": metric_table_id,
+                        "missing_table_ids": missing_required,
+                        "relationship_ids": plan.relationship_ids,
+                    },
+                )
+
+            select_items: list[str] = []
+            group_items: list[str] = []
+            key_aliases: list[str] = []
+            for dimension_index, column in enumerate(dimensions):
+                alias = aliases[column.table_id]
+                expression = f"{alias}.{_quote_ident(column.physical_name)}"
+                key_alias = f"k{dimension_index}"
+                select_items.append(f"{expression} AS {_quote_ident(key_alias)}")
+                group_items.append(expression)
+                key_aliases.append(key_alias)
+
+            metric_aliases: list[str] = []
+            for metric in metrics:
+                metric_alias = _safe_alias(metric.business_name)
+                select_items.append(
+                    f"{self._qualify_metric_formula(metric, catalog, aliases[metric.table_id])} "
+                    f"AS {_quote_ident(metric_alias)}"
+                )
+                metric_aliases.append(metric_alias)
+
+            where_items: list[str] = []
+            if time_column:
+                predicate = self._compile_time_range_predicate(
+                    aliases[time_column.table_id],
+                    time_column,
+                    plan.intent.time_range,
+                )
+                if predicate:
+                    where_items.append(predicate)
+            for filter_item in plan.intent.filters:
+                predicate = self._compile_filter_item(
+                    aliases,
+                    catalog,
+                    set(required_table_ids),
+                    filter_item,
+                )
+                if predicate:
+                    where_items.append(predicate)
+            for table_id, alias in aliases.items():
+                row_scope = self._compile_row_scope_predicate_for_table(
+                    catalog.table_by_id[table_id],
+                    alias,
+                    catalog,
+                    plan.user_access,
+                )
+                if row_scope:
+                    where_items.append(row_scope)
+
+            metric_table = catalog.table_by_id[metric_table_id]
+            sql_parts = [
+                "SELECT " + ", ".join(select_items),
+                f"FROM {_quote_ident(metric_table.physical_name)} m0",
+                *joins,
+            ]
+            if where_items:
+                sql_parts.append("WHERE " + " AND ".join(where_items))
+            if group_items:
+                sql_parts.append("GROUP BY " + ", ".join(group_items))
+            subqueries.append(
+                {
+                    "alias": f"g{index}",
+                    "sql": "\n".join(sql_parts),
+                    "keys": key_aliases,
+                    "metrics": metric_aliases,
+                }
+            )
+
+        limit = max(1, min(plan.intent.limit, self.MAX_LIMIT))
+        if not dimensions:
+            select_items = [
+                f"{subquery['alias']}.{_quote_ident(metric_alias)} AS {_quote_ident(metric_alias)}"
+                for subquery in subqueries
+                for metric_alias in subquery["metrics"]
+            ]
+            return "\n".join(
+                [
+                    "SELECT " + ", ".join(select_items),
+                    f"FROM ({subqueries[0]['sql']}) {subqueries[0]['alias']}",
+                    *[
+                        f"CROSS JOIN ({subquery['sql']}) {subquery['alias']}"
+                        for subquery in subqueries[1:]
+                    ],
+                    f"LIMIT {limit}",
+                ]
+            )
+
+        key_selects = [
+            "SELECT " + ", ".join(_quote_ident(key) for key in subquery["keys"])
+            + f" FROM ({subquery['sql']}) {subquery['alias']}_keys"
+            for subquery in subqueries
+        ]
+        key_source = "\nUNION\n".join(key_selects)
+        output_items = [
+            f"keys.{_quote_ident(f'k{index}')} AS {_quote_ident(_safe_alias(column.business_name))}"
+            for index, column in enumerate(dimensions)
+        ]
+        output_items.extend(
+            f"{subquery['alias']}.{_quote_ident(metric_alias)} AS {_quote_ident(metric_alias)}"
+            for subquery in subqueries
+            for metric_alias in subquery["metrics"]
+        )
+        sql_parts = [
+            "SELECT " + ", ".join(output_items),
+            f"FROM ({key_source}) keys",
+        ]
+        for subquery in subqueries:
+            conditions = " AND ".join(
+                f"{subquery['alias']}.{_quote_ident(key)} <=> keys.{_quote_ident(key)}"
+                for key in subquery["keys"]
+            )
+            sql_parts.append(
+                f"LEFT JOIN ({subquery['sql']}) {subquery['alias']} ON {conditions}"
+            )
+        if plan.intent.order_by:
+            first = plan.intent.order_by[0]
+            direction = "ASC" if first.get("direction") == "asc" else "DESC"
+            order_field = str(first.get("field") or "")
+            order_metric = next(
+                (
+                    metric
+                    for metric in metric_items
+                    if order_field in {metric.name, metric.business_name, _safe_alias(metric.business_name)}
+                ),
+                metric_items[0] if metric_items else None,
+            )
+            if order_metric:
+                sql_parts.append(
+                    f"ORDER BY {_quote_ident(_safe_alias(order_metric.business_name))} {direction}"
+                )
+        sql_parts.append(f"LIMIT {limit}")
         return "\n".join(sql_parts)
 
     def _metric_formula_columns(self, metric: SemanticMetric, catalog: SemanticCatalog) -> list[SemanticColumn]:
@@ -4352,22 +5691,28 @@ class SemanticQueryService:
             column = catalog.column_by_id.get(intent.selected_time_column_id)
             if column and column.table_id in table_ids and _is_active_semantic_column(column, catalog) and _is_time_column(column):
                 return column
-        preferred = self._preferred_time_column(table_ids, intent, catalog)
-        if preferred:
-            return preferred
         metric_time_columns = []
         for metric_name in intent.metrics:
             metric = self._find_metric(metric_name, catalog)
             if not metric or not metric.time_column_id:
                 continue
             column = catalog.column_by_id.get(metric.time_column_id)
-            if column and column.table_id in table_ids and _is_active_semantic_column(column, catalog):
+            if (
+                column
+                and column.table_id in table_ids
+                and _is_active_semantic_column(column, catalog)
+                and _is_time_column(column)
+            ):
                 metric_time_columns.append(column)
         unique_metric_columns = {
             column.id: column for column in metric_time_columns
         }
         if len(unique_metric_columns) == 1:
             return next(iter(unique_metric_columns.values()))
+
+        preferred = self._preferred_time_column(table_ids, intent, catalog)
+        if preferred:
+            return preferred
 
         candidate_columns = [
             column
@@ -4435,6 +5780,8 @@ class SemanticQueryService:
         if metric_names & {
             "sales_quantity",
             "sales_detail_amount",
+            "sales_detail_quantity",
+            "sales_order_line_count",
             "avg_sales_unit_price",
             "sum_clean_jf_sale_order_1_quantity",
             "sum_clean_jf_sale_order_1_tax_amount",
@@ -4447,7 +5794,14 @@ class SemanticQueryService:
             column = self._find_physical_column_in_tables("make_date", table_ids, catalog)
             if column:
                 return column
-        if any("销售订单" in name for name in intent.tables):
+        resolved_table_names = [
+            value
+            for table_id in table_ids
+            for table in [catalog.table_by_id.get(table_id)]
+            if table
+            for value in (table.business_name, table.physical_name)
+        ]
+        if any("销售订单" in name for name in [*intent.tables, *resolved_table_names]):
             column = self._find_physical_column_in_tables("make_date", table_ids, catalog)
             if column:
                 return column
@@ -4775,24 +6129,89 @@ class SemanticQueryService:
         intent: IntentQuery,
         user_access: dict[str, Any],
     ) -> Optional[SemanticClarification]:
-        options: list[SemanticClarificationOption] = []
-        seen_labels: set[str] = set()
+        option_groups: dict[str, SemanticClarificationOption] = {}
+        option_coverage: dict[str, set[tuple[str, int]]] = {}
+        blocked_keys = {
+            (str(item.get("object_type") or ""), int(item.get("object_id") or 0))
+            for item in blocked
+        }
         for blocked_item in blocked:
+            blocked_key = (
+                str(blocked_item.get("object_type") or ""),
+                int(blocked_item.get("object_id") or 0),
+            )
             for option in self._permission_rewrite_options(blocked_item, catalog, intent, user_access):
-                if option.label in seen_labels:
+                existing = option_groups.get(option.label)
+                if existing is None:
+                    option_groups[option.label] = option.model_copy(deep=True)
+                    option_coverage[option.label] = {blocked_key}
                     continue
-                seen_labels.add(option.label)
-                options.append(option)
+                existing.selection_patch = self._merge_permission_rewrite_patches(
+                    existing.selection_patch,
+                    option.selection_patch,
+                )
+                option_coverage[option.label].add(blocked_key)
+        options = [
+            option
+            for label, option in option_groups.items()
+            if option_coverage.get(label) == blocked_keys
+        ]
         if not options:
             return None
+        base_intent = intent.model_dump(mode="json")
+        for option in options:
+            option.selection_patch["base_intent"] = base_intent
         blocked_labels = "、".join(item.get("label") or "未授权对象" for item in blocked)
         return SemanticClarification(
             kind="permission_rewrite_required",
-            message=f"当前问题涉及您无权访问的语义对象：{blocked_labels}。请选择一个可访问的替代口径后继续。",
+            message=f"当前问题涉及您无权访问的对象：{blocked_labels}。请选择您想查询的替代内容",
             options=options[:8],
             blocked_objects=blocked,
-            original_intent=intent.model_dump(mode="json"),
+            original_intent=base_intent,
         )
+
+    def _merge_permission_rewrite_patches(
+        self,
+        current: dict[str, Any],
+        incoming: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(current)
+        for singular, plural in (
+            ("replace_column", "replace_columns"),
+            ("replace_metric", "replace_metrics"),
+            ("replace_table", "replace_tables"),
+        ):
+            replacements: list[dict[str, Any]] = []
+            for source in (current, incoming):
+                many = source.get(plural)
+                if isinstance(many, list):
+                    replacements.extend(item for item in many if isinstance(item, dict))
+                one = source.get(singular)
+                if isinstance(one, dict):
+                    replacements.append(one)
+            if not replacements:
+                continue
+            unique: list[dict[str, Any]] = []
+            seen: set[tuple[Any, Any]] = set()
+            for replacement in replacements:
+                key = (replacement.get("from_id"), replacement.get("to_id"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique.append(replacement)
+            merged.pop(singular, None)
+            merged[plural] = unique
+        for key, value in incoming.items():
+            if key not in {
+                "replace_column",
+                "replace_columns",
+                "replace_metric",
+                "replace_metrics",
+                "replace_table",
+                "replace_tables",
+            }:
+                merged[key] = value
+        return merged
 
     def _permission_rewrite_options(
         self,
@@ -5002,7 +6421,54 @@ class SemanticQueryService:
         patch = semantic_clarification.get("selection_patch")
         if not isinstance(patch, dict):
             patch = semantic_clarification
-        data = intent.model_dump(mode="json")
+        patch = dict(patch)
+        free_text_time_range = self._extract_time_range(
+            str(semantic_clarification.get("free_text") or "")
+        )
+        if free_text_time_range:
+            free_text_intent_patch = dict(patch.get("intent_patch") or {})
+            free_text_intent_patch["time_range"] = free_text_time_range
+            patch["intent_patch"] = free_text_intent_patch
+        legacy_column_choice = patch.get("replace_column")
+        if (
+            isinstance(legacy_column_choice, dict)
+            and legacy_column_choice.get("to_id")
+            and not legacy_column_choice.get("from_id")
+            and not legacy_column_choice.get("from_name")
+        ):
+            legacy_column_choice = dict(legacy_column_choice)
+            selected_column = catalog.column_by_id.get(int(legacy_column_choice["to_id"]))
+            legacy_column_choice["from_name"] = str(
+                legacy_column_choice.get("to_business_name")
+                or (selected_column.business_name if selected_column else "")
+            )
+            legacy_column_choice.pop("to_business_name", None)
+            patch["replace_column"] = legacy_column_choice
+            legacy_intent_patch = dict(patch.get("intent_patch") or {})
+            legacy_intent_patch.pop("dimensions", None)
+            selected_table = (
+                catalog.table_by_id.get(selected_column.table_id)
+                if selected_column
+                else None
+            )
+            if selected_table:
+                legacy_intent_patch["tables"] = [selected_table.physical_name]
+            patch["intent_patch"] = legacy_intent_patch
+        base_intent = patch.get("base_intent")
+        if isinstance(base_intent, dict):
+            try:
+                base_data = IntentQuery(**base_intent).model_dump(mode="json")
+                current_data = intent.model_dump(mode="json")
+                default_data = IntentQuery().model_dump(mode="json")
+                data = (
+                    current_data
+                    if base_data == default_data and current_data != default_data
+                    else base_data
+                )
+            except Exception:  # noqa: BLE001
+                data = intent.model_dump(mode="json")
+        else:
+            data = intent.model_dump(mode="json")
         intent_patch = patch.get("intent_patch")
         if isinstance(intent_patch, dict):
             for key, value in intent_patch.items():
@@ -5010,8 +6476,14 @@ class SemanticQueryService:
                     data[key] = value
         if patch.get("selected_time_column_id"):
             data["selected_time_column_id"] = int(patch["selected_time_column_id"])
-        replace_metric = patch.get("replace_metric") if isinstance(patch.get("replace_metric"), dict) else None
-        if replace_metric:
+        replace_metrics = [
+            item
+            for item in (patch.get("replace_metrics") or [])
+            if isinstance(item, dict)
+        ]
+        if isinstance(patch.get("replace_metric"), dict):
+            replace_metrics.append(patch["replace_metric"])
+        for replace_metric in replace_metrics:
             from_id = replace_metric.get("from_id")
             to_name = str(replace_metric.get("to_name") or replace_metric.get("to_business_name") or "")
             from_metric = catalog.metric_by_id.get(int(from_id)) if from_id else None
@@ -5020,8 +6492,14 @@ class SemanticQueryService:
                 to_name if _normalize_term(item) in from_labels else item
                 for item in data.get("metrics", [])
             ]
-        replace_table = patch.get("replace_table") if isinstance(patch.get("replace_table"), dict) else None
-        if replace_table:
+        replace_tables = [
+            item
+            for item in (patch.get("replace_tables") or [])
+            if isinstance(item, dict)
+        ]
+        if isinstance(patch.get("replace_table"), dict):
+            replace_tables.append(patch["replace_table"])
+        for replace_table in replace_tables:
             from_id = replace_table.get("from_id")
             to_name = str(replace_table.get("to_business_name") or replace_table.get("to_name") or "")
             from_table = catalog.table_by_id.get(int(from_id)) if from_id else None
@@ -5030,8 +6508,14 @@ class SemanticQueryService:
                 to_name if _normalize_term(item) in from_labels else item
                 for item in data.get("tables", [])
             ]
-        replace_column = patch.get("replace_column") if isinstance(patch.get("replace_column"), dict) else None
-        if replace_column:
+        replace_columns = [
+            item
+            for item in (patch.get("replace_columns") or [])
+            if isinstance(item, dict)
+        ]
+        if isinstance(patch.get("replace_column"), dict):
+            replace_columns.append(patch["replace_column"])
+        for replace_column in replace_columns:
             from_id = replace_column.get("from_id")
             to_name = str(replace_column.get("to_business_name") or replace_column.get("to_name") or "")
             from_column = catalog.column_by_id.get(int(from_id)) if from_id else None
@@ -5046,6 +6530,8 @@ class SemanticQueryService:
             for item in data.get("order_by", []):
                 if isinstance(item, dict) and _normalize_term(str(item.get("field") or "")) in from_labels:
                     item["field"] = to_name
+        for key in ("tables", "metrics", "dimensions"):
+            data[key] = list(dict.fromkeys(data.get(key, [])))
         return IntentQuery(**data)
 
     def _semantic_object_labels(self, obj: Any) -> set[str]:
@@ -5071,7 +6557,18 @@ class SemanticQueryService:
             return SemanticClarification(**existing)
         if exc.error_type == "permission_rewrite_required":
             return SemanticClarification(**existing) if isinstance(existing, dict) else None
-        if exc.error_type in {"field_ambiguous", "table_ambiguous", "time_field_ambiguous", "clarification_required"}:
+        if exc.error_type in {"metric_ambiguous", "field_ambiguous", "table_ambiguous", "time_field_ambiguous", "clarification_required"}:
+            if exc.error_type == "metric_ambiguous" and exc.details.get("candidate_metric_ids"):
+                return self._object_choice_clarification(
+                    kind="metric_ambiguous",
+                    message="指标存在多个候选，请选择本次查询要使用的指标。",
+                    object_type="metric",
+                    ids=exc.details.get("candidate_metric_ids") or [],
+                    catalog=catalog,
+                    intent=intent,
+                    user_access=user_access,
+                    requested_name=str(exc.details.get("matched_term") or ""),
+                )
             if exc.error_type in {"time_field_ambiguous", "clarification_required"} and exc.details.get("candidate_time_columns"):
                 return self._time_field_clarification(exc, catalog, intent, user_access)
             if exc.error_type == "field_ambiguous" and exc.details.get("candidate_column_ids"):
@@ -5083,6 +6580,7 @@ class SemanticQueryService:
                     catalog=catalog,
                     intent=intent,
                     user_access=user_access,
+                    requested_name=str(exc.details.get("requested_name") or ""),
                 )
             if exc.error_type == "table_ambiguous" and exc.details.get("candidate_table_ids"):
                 return self._object_choice_clarification(
@@ -5093,6 +6591,7 @@ class SemanticQueryService:
                     catalog=catalog,
                     intent=intent,
                     user_access=user_access,
+                    requested_name=str(exc.details.get("requested_name") or ""),
                 )
         return None
 
@@ -5137,33 +6636,62 @@ class SemanticQueryService:
         catalog: SemanticCatalog,
         intent: IntentQuery,
         user_access: dict[str, Any],
+        requested_name: str = "",
     ) -> Optional[SemanticClarification]:
         options: list[SemanticClarificationOption] = []
+        base_intent = intent.model_dump(mode="json")
+        base_patch = (
+            {}
+            if base_intent == IntentQuery().model_dump(mode="json")
+            else {"base_intent": base_intent}
+        )
         for raw_id in ids:
             object_id = int(raw_id)
-            obj = catalog.column_by_id.get(object_id) if object_type == "column" else catalog.table_by_id.get(object_id)
+            if object_type == "column":
+                obj = catalog.column_by_id.get(object_id)
+            elif object_type == "metric":
+                obj = catalog.metric_by_id.get(object_id)
+            else:
+                obj = catalog.table_by_id.get(object_id)
             if not obj or not self._semantic_permission_action(object_type, obj, user_access):
                 continue
             if object_type == "column":
                 table = catalog.table_by_id.get(obj.table_id)
                 label = f"{table.business_name if table else obj.physical_table}.{obj.business_name}"
                 patch = {
+                    **base_patch,
                     "replace_column": {
+                        "from_name": requested_name or obj.business_name,
                         "to_id": obj.id,
                         "to_name": obj.physical_name,
-                        "to_business_name": obj.business_name,
                     },
-                    "intent_patch": {"dimensions": [obj.business_name]},
+                    "intent_patch": {
+                        "tables": [table.physical_name if table else obj.physical_table],
+                    },
+                }
+            elif object_type == "metric":
+                table = catalog.table_by_id.get(obj.table_id)
+                label = f"{table.business_name if table else obj.table_id}.{obj.business_name}"
+                patch = {
+                    **base_patch,
+                    "replace_metric": {
+                        "from_name": requested_name or obj.business_name,
+                        "to_id": obj.id,
+                        "to_name": obj.name,
+                    },
+                    "intent_patch": {
+                        "tables": [table.physical_name] if table else list(intent.tables),
+                    },
                 }
             else:
                 label = obj.business_name
                 patch = {
+                    **base_patch,
                     "replace_table": {
+                        "from_name": requested_name or obj.business_name,
                         "to_id": obj.id,
                         "to_name": obj.physical_name,
-                        "to_business_name": obj.business_name,
                     },
-                    "intent_patch": {"tables": [obj.business_name]},
                 }
             options.append(
                 SemanticClarificationOption(
@@ -5224,7 +6752,7 @@ class SemanticQueryService:
                     break
             if not match:
                 raise SemanticQueryError(
-                    "join_path_ambiguous",
+                    "semantic_model_incomplete",
                     "多表查询缺少已确认 Join 路径",
                     retryable=False,
                     safe_to_fallback=True,
@@ -5549,16 +7077,3 @@ def get_semantic_query_service() -> SemanticQueryService:
     if _semantic_query_service is None:
         _semantic_query_service = SemanticQueryService()
     return _semantic_query_service
-
-
-
-
-
-
-
-
-
-
-
-
-

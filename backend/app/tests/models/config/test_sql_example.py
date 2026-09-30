@@ -70,6 +70,7 @@ async def test_batch_delete_sql_examples_only_deletes_owned_vectors(monkeypatch)
     deleted_count = await module.batch_delete_sql_examples_async(
         example_ids=[1, 2, 3],
         workspace_id="ws-1",
+        owner_id="tester",
     )
 
     assert deleted_count == 2
@@ -97,6 +98,7 @@ async def test_batch_delete_sql_examples_raises_when_vector_delete_fails(monkeyp
         await module.batch_delete_sql_examples_async(
             example_ids=[1, 2, 3],
             workspace_id="ws-1",
+            owner_id="tester",
         )
 
     assert deleted_vector_ids == [[1, 3]]

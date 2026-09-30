@@ -6,9 +6,9 @@ SQL 示例配置模型
 """
 import logging
 from datetime import datetime
-from typing import Optional, List
+from typing import Any, Optional, List
 from pydantic import BaseModel, Field
-from sqlalchemy import Column, String, Integer, DateTime, Text, Boolean, select, delete
+from sqlalchemy import JSON, Column, String, Integer, DateTime, Text, Boolean, select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db.database import Base, get_async_db_manager
@@ -37,6 +37,17 @@ class SqlExampleModel(Base, TenantMixin):
     group_id = Column(Integer, nullable=True, index=True, comment="所属分组ID")
     # workspace_id 继承自 TenantMixin，不再手动定义
     created_by = Column(String(64), nullable=False, comment="创建者ID")
+    normalized_question = Column(String(500), nullable=False, default="", comment="参数化后的问题")
+    validation_status = Column(String(20), nullable=False, default="draft", index=True, comment="draft/valid/invalid/stale")
+    validation_errors = Column(JSON, nullable=False, default=list, comment="校验错误")
+    parameters_json = Column(JSON, nullable=False, default=list, comment="动态参数定义")
+    intent_json = Column(JSON, nullable=False, default=dict, comment="安全的结构化语义意图")
+    schema_fingerprint = Column(String(128), nullable=True, comment="校验时语义模型指纹")
+    authorization_revision = Column(Integer, nullable=False, default=0, comment="校验时权限版本")
+    validation_model_version = Column(Integer, nullable=False, default=1, comment="示例校验模型版本")
+    validated_at = Column(DateTime, nullable=True)
+    last_matched_at = Column(DateTime, nullable=True)
+    match_count = Column(Integer, nullable=False, default=0)
     # [架构优化] 向量同步状态：synced/pending_add/pending_update/pending_delete
     vector_sync_status = Column(String(20), default='synced', comment="向量库同步状态")
     created_at = Column(DateTime, default=datetime.now)
@@ -56,6 +67,17 @@ class SqlExample(BaseModel):
     group_id: Optional[int] = None
     workspace_id: str
     created_by: str
+    normalized_question: str = ""
+    validation_status: str = "draft"
+    validation_errors: list[dict[str, Any]] = Field(default_factory=list)
+    parameters: list[dict[str, Any]] = Field(default_factory=list)
+    intent: dict[str, Any] = Field(default_factory=dict)
+    schema_fingerprint: Optional[str] = None
+    authorization_revision: int = 0
+    validation_model_version: int = 1
+    validated_at: Optional[datetime] = None
+    last_matched_at: Optional[datetime] = None
+    match_count: int = 0
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
     
@@ -72,6 +94,17 @@ class SqlExample(BaseModel):
             group_id=orm_obj.group_id,
             workspace_id=orm_obj.workspace_id,
             created_by=orm_obj.created_by,
+            normalized_question=orm_obj.normalized_question or "",
+            validation_status=orm_obj.validation_status or "draft",
+            validation_errors=list(orm_obj.validation_errors or []),
+            parameters=list(orm_obj.parameters_json or []),
+            intent=dict(orm_obj.intent_json or {}),
+            schema_fingerprint=orm_obj.schema_fingerprint,
+            authorization_revision=int(orm_obj.authorization_revision or 0),
+            validation_model_version=int(orm_obj.validation_model_version or 1),
+            validated_at=orm_obj.validated_at,
+            last_matched_at=orm_obj.last_matched_at,
+            match_count=int(orm_obj.match_count or 0),
             created_at=orm_obj.created_at,
             updated_at=orm_obj.updated_at
         )
@@ -84,6 +117,8 @@ class SqlExampleCreate(BaseModel):
     description: Optional[str] = None
     tables: Optional[str] = None
     group_id: Optional[int] = None
+    is_active: bool = False
+    parameters: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SqlExampleUpdate(BaseModel):
@@ -94,6 +129,21 @@ class SqlExampleUpdate(BaseModel):
     tables: Optional[str] = None
     is_active: Optional[bool] = None
     group_id: Optional[int] = None
+    parameters: Optional[list[dict[str, Any]]] = None
+
+
+class SqlExampleValidationData(BaseModel):
+    """仅供服务层写入的校验结果。"""
+
+    normalized_question: str = ""
+    status: str = "draft"
+    errors: list[dict[str, Any]] = Field(default_factory=list)
+    parameters: list[dict[str, Any]] = Field(default_factory=list)
+    intent: dict[str, Any] = Field(default_factory=dict)
+    schema_fingerprint: Optional[str] = None
+    authorization_revision: int = 0
+    model_version: int = 1
+    preview_sql: str = ""
 
 
 # ========== 异步 CRUD 函数 ==========
@@ -101,11 +151,14 @@ class SqlExampleUpdate(BaseModel):
 async def create_sql_example_async(
     example: SqlExampleCreate,
     workspace_id: str,
-    user_id: str
+    user_id: str,
+    validation: Optional[SqlExampleValidationData] = None,
 ) -> SqlExample:
     """创建 SQL 示例（带向量同步补偿机制）"""
     db_manager = get_async_db_manager()
     async with db_manager.session_scope() as session:
+        validation = validation or SqlExampleValidationData()
+        can_enable = validation.status == "valid"
         orm_obj = SqlExampleModel(
             question=example.question,
             sql=example.sql,
@@ -114,7 +167,16 @@ async def create_sql_example_async(
             group_id=example.group_id,
             workspace_id=workspace_id,
             created_by=user_id,
-            is_active=True,
+            is_active=bool(example.is_active and can_enable),
+            normalized_question=validation.normalized_question,
+            validation_status=validation.status,
+            validation_errors=validation.errors,
+            parameters_json=validation.parameters,
+            intent_json=validation.intent,
+            schema_fingerprint=validation.schema_fingerprint,
+            authorization_revision=validation.authorization_revision,
+            validation_model_version=validation.model_version,
+            validated_at=datetime.now() if can_enable else None,
             vector_sync_status='pending_add'  # 先标记为待同步
         )
         session.add(orm_obj)
@@ -129,9 +191,12 @@ async def create_sql_example_async(
             question=orm_obj.question,
             sql=orm_obj.sql,
             workspace_id=orm_obj.workspace_id,
+            owner_id=orm_obj.created_by,
             description=orm_obj.description or "",
             tables=orm_obj.tables or "",
             is_active=bool(orm_obj.is_active),
+            validation_status=orm_obj.validation_status,
+            normalized_question=orm_obj.normalized_question or "",
         )
         
         # [补偿机制] 更新同步状态
@@ -156,7 +221,9 @@ async def get_sql_example_async(example_id: int) -> Optional[SqlExample]:
 
 async def list_sql_examples_async(
     workspace_id: str,
+    owner_id: Optional[str] = None,
     active_only: bool = False,
+    validation_status: Optional[str] = None,
     group_id: Optional[int] = None,
     limit: int = 50,
     offset: int = 0
@@ -173,9 +240,15 @@ async def list_sql_examples_async(
     async with db_manager.session_scope() as session:
         # 基础查询条件
         base_where = [SqlExampleModel.workspace_id == workspace_id]
+
+        if owner_id is not None:
+            base_where.append(SqlExampleModel.created_by == owner_id)
         
         if active_only:
             base_where.append(SqlExampleModel.is_active == True)
+
+        if validation_status:
+            base_where.append(SqlExampleModel.validation_status == validation_status)
         
         if group_id is not None:
             base_where.append(SqlExampleModel.group_id == group_id)
@@ -208,7 +281,8 @@ async def list_sql_examples_async(
 
 async def update_sql_example_async(
     example_id: int,
-    update_data: SqlExampleUpdate
+    update_data: SqlExampleUpdate,
+    validation: Optional[SqlExampleValidationData] = None,
 ) -> Optional[SqlExample]:
     """更新 SQL 示例（带向量同步补偿机制）"""
     db_manager = get_async_db_manager()
@@ -230,9 +304,25 @@ async def update_sql_example_async(
             orm_obj.description = update_data.description
         if update_data.tables is not None:
             orm_obj.tables = update_data.tables
+        if validation is not None:
+            orm_obj.normalized_question = validation.normalized_question
+            orm_obj.validation_status = validation.status
+            orm_obj.validation_errors = validation.errors
+            orm_obj.parameters_json = validation.parameters
+            orm_obj.intent_json = validation.intent
+            orm_obj.schema_fingerprint = validation.schema_fingerprint
+            orm_obj.authorization_revision = validation.authorization_revision
+            orm_obj.validation_model_version = validation.model_version
+            orm_obj.validated_at = datetime.now() if validation.status == "valid" else None
+            if validation.status != "valid":
+                orm_obj.is_active = False
+        elif update_data.parameters is not None:
+            orm_obj.parameters_json = update_data.parameters
         if update_data.is_active is not None:
-            orm_obj.is_active = update_data.is_active
-        if update_data.group_id is not None:
+            orm_obj.is_active = bool(
+                update_data.is_active and orm_obj.validation_status == "valid"
+            )
+        if "group_id" in update_data.model_fields_set:
             orm_obj.group_id = update_data.group_id
         
         orm_obj.updated_at = datetime.now()
@@ -245,9 +335,12 @@ async def update_sql_example_async(
             question=orm_obj.question,
             sql=orm_obj.sql,
             workspace_id=orm_obj.workspace_id,
+            owner_id=orm_obj.created_by,
             description=orm_obj.description or "",
             tables=orm_obj.tables or "",
             is_active=bool(orm_obj.is_active),
+            validation_status=orm_obj.validation_status,
+            normalized_question=orm_obj.normalized_question or "",
         )
         
         # [补偿机制] 更新同步状态
@@ -282,7 +375,8 @@ async def delete_sql_example_async(example_id: int) -> bool:
 
 async def batch_delete_sql_examples_async(
     example_ids: List[int],
-    workspace_id: str
+    workspace_id: str,
+    owner_id: str,
 ) -> int:
     """
     批量删除 SQL 示例（事务 + 批量向量删除）
@@ -306,7 +400,8 @@ async def batch_delete_sql_examples_async(
                 await session.execute(
                     select(SqlExampleModel.id).where(
                         SqlExampleModel.id.in_(example_ids),
-                        SqlExampleModel.workspace_id == workspace_id
+                        SqlExampleModel.workspace_id == workspace_id,
+                        SqlExampleModel.created_by == owner_id,
                     )
                 )
             ).scalars().all()
@@ -319,7 +414,8 @@ async def batch_delete_sql_examples_async(
         result = await session.execute(
             delete(SqlExampleModel).where(
                 SqlExampleModel.id.in_(owned_ids),
-                SqlExampleModel.workspace_id == workspace_id  # 权限验证
+                SqlExampleModel.workspace_id == workspace_id,
+                SqlExampleModel.created_by == owner_id,
             )
         )
         
@@ -341,7 +437,8 @@ async def batch_delete_sql_examples_async(
 async def batch_move_to_group_async(
     example_ids: List[int],
     group_id: Optional[int],
-    workspace_id: str
+    workspace_id: str,
+    owner_id: str,
 ) -> int:
     """
     批量移动 SQL 示例到指定分组
@@ -365,7 +462,8 @@ async def batch_move_to_group_async(
             update(SqlExampleModel)
             .where(
                 SqlExampleModel.id.in_(example_ids),
-                SqlExampleModel.workspace_id == workspace_id
+                SqlExampleModel.workspace_id == workspace_id,
+                SqlExampleModel.created_by == owner_id,
             )
             .values(group_id=group_id, updated_at=datetime.now())
         )

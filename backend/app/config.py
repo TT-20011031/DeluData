@@ -131,6 +131,43 @@ class ChromaSettings(BaseSettings):
     )
 
 
+class SemanticRowOwnershipSettings(BaseSettings):
+    """Bounded settings for AI-assisted first-time row ownership discovery."""
+
+    enabled: bool = True
+    candidate_confidence: float = 0.90
+    candidate_margin: float = 0.15
+    candidate_limit: int = 8
+    expanded_candidate_confidence: float = 0.95
+    expanded_candidate_margin: float = 0.20
+    value_confidence: float = 0.90
+    expanded_value_confidence: float = 0.95
+    max_distinct_values: int = 500
+    probe_timeout_sec: int = 10
+
+    model_config = SettingsConfigDict(
+        env_prefix="SEMANTIC_ROW_OWNERSHIP_",
+        env_file=ENV_FILE,
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
+class SemanticAccessEvidenceSettings(BaseSettings):
+    """Controls automatic access-evidence lifecycle hooks."""
+
+    # Access evidence remains manually generatable, but semantic metadata edits
+    # must not invalidate reviewed evidence or enqueue a replacement by default.
+    auto_regenerate_on_semantic_change: bool = False
+
+    model_config = SettingsConfigDict(
+        env_prefix="SEMANTIC_ACCESS_EVIDENCE_",
+        env_file=ENV_FILE,
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
 class AppSettings(BaseSettings):
     """应用配置"""
     env: str = "development"
@@ -975,6 +1012,8 @@ class Settings:
         self._template_detector = None
         self._pageindex = None
         self._wiki = None
+        self._semantic_row_ownership = None
+        self._semantic_access_evidence = None
     
     @property
     def db(self) -> DatabaseSettings:
@@ -1097,6 +1136,18 @@ class Settings:
         return self._wiki
 
     @property
+    def semantic_row_ownership(self) -> SemanticRowOwnershipSettings:
+        if self._semantic_row_ownership is None:
+            self._semantic_row_ownership = SemanticRowOwnershipSettings()
+        return self._semantic_row_ownership
+
+    @property
+    def semantic_access_evidence(self) -> SemanticAccessEvidenceSettings:
+        if self._semantic_access_evidence is None:
+            self._semantic_access_evidence = SemanticAccessEvidenceSettings()
+        return self._semantic_access_evidence
+
+    @property
     def upload_dir(self) -> str:
         return os.path.join(self.storage.local_root, "workspace_uploads")
 
@@ -1108,5 +1159,3 @@ def get_settings() -> Settings:
     使用 lru_cache 确保只加载一次配置
     """
     return Settings()
-
-

@@ -1,6 +1,8 @@
 ﻿import { useMemo, useState } from 'react'
+import { useEffect } from 'react'
 import {
     AlertTriangle,
+    ArrowLeft,
     ChevronDown,
     CircleCheck,
     Database,
@@ -42,6 +44,7 @@ import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
 import { useSemanticModels } from '@/hooks/extendConfig'
+import { splitSemanticTerms } from '@/utils/semanticTerms'
 import { readinessGuidance, readinessLabel } from './semanticTrustUtils'
 import { SemanticAccessPolicyWorkspaceV2 } from './SemanticAccessPolicyWorkspaceV2'
 import type {
@@ -125,6 +128,15 @@ type PendingReviewAsset = {
     scanId: number | null
 }
 
+const FULLSCREEN_WORKSPACES: SemanticWorkspace[] = [
+    'access-policies',
+    'tables',
+    'metrics',
+    'relationships',
+    'runs',
+    'evaluation',
+]
+
 const WORKSPACE_META: Record<SemanticWorkspace, { title: string; description: string }> = {
     governance: {
         title: '候选治理中心',
@@ -140,7 +152,7 @@ const WORKSPACE_META: Record<SemanticWorkspace, { title: string; description: st
     },
     tables: {
         title: '表字段',
-        description: '维护语义表、字段业务名、同义词、敏感分类和启停状态；权限统一在问数数据权限中配置。',
+        description: '维护语义表、字段业务名、同义词、敏感分类和启停状态。',
     },
     metrics: {
         title: '指标',
@@ -231,6 +243,15 @@ function accessBadges(isSensitive: boolean, semanticReview?: string) {
                 策略中心
             </Badge>
         </div>
+    )
+}
+
+function sensitivityBadge(isSensitive: boolean) {
+    if (!isSensitive) return null
+    return (
+        <Badge variant="outline" className="h-6 border-rose-500/30 bg-rose-500/10 text-xs text-rose-400">
+            敏感
+        </Badge>
     )
 }
 
@@ -359,7 +380,7 @@ function metricPatch(form: SemanticMetricForm) {
         time_column_id: form.time_column_id,
         default_grain: form.default_grain || null,
         description: form.description,
-        synonyms: form.synonyms.split(',').map(item => item.trim()).filter(Boolean),
+        synonyms: splitSemanticTerms(form.synonyms),
         status: form.status,
         is_queryable: form.is_queryable,
         is_sensitive: form.is_sensitive,
@@ -405,6 +426,9 @@ export function SemanticModelManager({
 } = {}) {
     const {
         data,
+        tableBusinessSuggestions,
+        modelCounts,
+        hasLoadedModels,
         isLoading,
         isSaving,
         isPreviewing,
@@ -471,20 +495,17 @@ export function SemanticModelManager({
     const [rejectReason, setRejectReason] = useState('')
     const [selectedCandidateIds, setSelectedCandidateIds] = useState<number[]>([])
 
+    useEffect(() => {
+        if (hasLoadedModels || isLoading || !activeWorkspace) return
+        if (!['review', 'access-policies', 'tables', 'metrics', 'relationships', 'runs'].includes(activeWorkspace)) return
+        void load()
+    }, [activeWorkspace, hasLoadedModels, isLoading, load])
+
     const activeColumns = useMemo(
         () => (activeTable ? columnsByTable[activeTable.id] || [] : []),
         [activeTable, columnsByTable]
     )
-    const activeTableSuggestions = useMemo(() => {
-        if (!activeTable) return []
-        return data.business_suggestions.filter(suggestion => (
-            suggestion.status === 'pending' &&
-            (
-                (suggestion.object_type === 'table' && suggestion.object_id === activeTable.id) ||
-                (suggestion.object_type === 'column' && Number(suggestion.target_context?.table_id) === activeTable.id)
-            )
-        ))
-    }, [activeTable, data.business_suggestions])
+    const activeTableSuggestions = tableBusinessSuggestions
     const businessSuggestionForObject = (objectType: 'table' | 'column', objectId: number) =>
         activeTableSuggestions.find(suggestion => suggestion.object_type === objectType && suggestion.object_id === objectId)
     const confirmedTables = data.tables.filter(table => table.status === 'confirmed' && table.is_queryable && (table.sync_state || 'current') === 'current')
@@ -542,8 +563,13 @@ export function SemanticModelManager({
         }))
         return assets.sort((left, right) => Number(right.syncState === 'orphaned') - Number(left.syncState === 'orphaned') || left.kind.localeCompare(right.kind, 'zh-CN'))
     }, [data.columns, data.metrics, data.relationships, data.tables])
-    const staleReviewCount = pendingReviewAssets.filter(asset => asset.syncState === 'stale').length
-    const orphanedReviewCount = pendingReviewAssets.filter(asset => asset.syncState === 'orphaned').length
+    const staleReviewCount = hasLoadedModels
+        ? pendingReviewAssets.filter(asset => asset.syncState === 'stale').length
+        : modelCounts.stale_assets
+    const orphanedReviewCount = hasLoadedModels
+        ? pendingReviewAssets.filter(asset => asset.syncState === 'orphaned').length
+        : modelCounts.orphaned_assets
+    const pendingReviewCount = staleReviewCount + orphanedReviewCount
     const latestEvalRuns = useMemo(() => latestRunByCase(evalRuns), [evalRuns])
     const activeWorkspaceMeta = activeWorkspace ? WORKSPACE_META[activeWorkspace] : null
     const openGovernanceCandidates = governanceCandidates.filter(candidate => ['proposed', 'needs_review', 'blocked'].includes(candidate.status))
@@ -646,36 +672,36 @@ export function SemanticModelManager({
         {
             id: 'access-policies',
             label: '问数权限',
-            count: data.tables.length,
+            count: hasLoadedModels ? data.tables.length : modelCounts.tables,
             detail: '按用户与角色配置可见资产和行范围',
             icon: Lock,
         },
         {
             id: 'tables',
             label: '表字段',
-            count: data.tables.length,
-            detail: `${confirmedTables.length} 张表、${confirmedColumns.length} 个字段已启用`,
+            count: hasLoadedModels ? data.tables.length : modelCounts.tables,
+            detail: `${hasLoadedModels ? confirmedTables.length : modelCounts.queryable_tables} 张表、${hasLoadedModels ? confirmedColumns.length : modelCounts.queryable_columns} 个字段已启用`,
             icon: GitBranch,
         },
         {
             id: 'metrics',
             label: '指标',
-            count: data.metrics.length,
-            detail: `${confirmedMetrics.length} 个指标可查询`,
+            count: hasLoadedModels ? data.metrics.length : modelCounts.metrics,
+            detail: `${hasLoadedModels ? confirmedMetrics.length : modelCounts.queryable_metrics} 个指标可查询`,
             icon: Sigma,
         },
         {
             id: 'relationships',
             label: '关系',
-            count: data.relationships.length,
-            detail: `${confirmedRelationships.length} 条关系已确认`,
+            count: hasLoadedModels ? data.relationships.length : modelCounts.relationships,
+            detail: `${hasLoadedModels ? confirmedRelationships.length : modelCounts.queryable_relationships} 条关系已确认`,
             icon: ShieldCheck,
         },
         {
             id: 'runs',
             label: '运行记录',
-            count: data.recent_runs.length,
-            detail: `${data.recent_runs.filter(run => run.status === 'success').length} 次最近成功`,
+            count: hasLoadedModels ? data.recent_runs.length : modelCounts.recent_runs,
+            detail: `${hasLoadedModels ? data.recent_runs.filter(run => run.status === 'success').length : modelCounts.recent_success_runs} 次最近成功`,
             icon: PlayCircle,
         },
         {
@@ -780,7 +806,7 @@ export function SemanticModelManager({
     const draftPayload = (draft: SuggestionDraft) => ({
         business_name: draft.businessName,
         description: draft.description,
-        synonyms: draft.synonyms.split(',').map(item => item.trim()).filter(Boolean),
+        synonyms: splitSemanticTerms(draft.synonyms),
     })
 
     const saveObjectEdit = async (
@@ -984,11 +1010,11 @@ export function SemanticModelManager({
                             >
                                 <div className="flex items-center justify-between">
                                     <span className="text-xs font-semibold uppercase tracking-[0.16em] text-[#8a857d]">待复核资产</span>
-                                    <AlertTriangle className={cn('h-5 w-5', pendingReviewAssets.length ? 'text-amber-500' : 'text-emerald-500')} />
+                                    <AlertTriangle className={cn('h-5 w-5', pendingReviewCount ? 'text-amber-500' : 'text-emerald-500')} />
                                 </div>
                                 <div className="mt-3 flex items-end justify-between gap-4">
                                     <div>
-                                        <div className="text-3xl font-semibold text-[#252421]">{pendingReviewAssets.length}</div>
+                                        <div className="text-3xl font-semibold text-[#252421]">{pendingReviewCount}</div>
                                         <div className="mt-1 text-xs text-[#777268]">{staleReviewCount} 个过期 · {orphanedReviewCount} 个失联</div>
                                     </div>
                                     <span className="pb-1 text-xs font-medium text-amber-700 transition-transform group-hover:translate-x-0.5">进入复核 →</span>
@@ -1140,26 +1166,38 @@ export function SemanticModelManager({
                     hideCloseButton
                     className={cn(
                         'flex flex-col overflow-hidden bg-manus-secondary p-0 text-manus-text',
-                        activeWorkspace === 'access-policies'
+                        activeWorkspace && FULLSCREEN_WORKSPACES.includes(activeWorkspace)
                             ? 'h-screen w-screen max-w-none rounded-none border-0 sm:rounded-none'
                             : 'h-[calc(100vh-32px)] w-[calc(100vw-32px)] max-w-7xl border-manus-border'
                     )}
                 >
-                    {activeWorkspace !== 'access-policies' && <DialogHeader className="shrink-0 border-b border-manus-border px-4 py-3">
+                    {activeWorkspace !== 'access-policies' && <DialogHeader className={cn(
+                        'shrink-0 border-b border-manus-border',
+                        activeWorkspace && FULLSCREEN_WORKSPACES.includes(activeWorkspace)
+                            ? 'flex min-h-[88px] justify-center bg-manus/95 px-4 py-4 backdrop-blur md:px-6'
+                            : 'px-4 py-3',
+                    )}>
                         <div className="flex flex-wrap items-center justify-between gap-3">
                             <div className="min-w-0">
-                                <DialogTitle className="flex items-center gap-2 text-lg">
-                                    <Network className="h-5 w-5 text-accent" />
+                                <DialogTitle className={cn(
+                                    'flex items-center gap-2 font-semibold tracking-tight',
+                                    activeWorkspace && FULLSCREEN_WORKSPACES.includes(activeWorkspace) ? 'text-xl' : 'text-lg',
+                                )}>
+                                    <Network className="h-5 w-5 text-emerald-400" />
                                     {activeWorkspaceMeta?.title || '语义工作区'}
                                 </DialogTitle>
                                 <div className="mt-1 text-sm text-manus-muted">{activeWorkspaceDescription}</div>
                             </div>
-                            <Button size="sm" variant="outline" onClick={() => setActiveWorkspace(null)} className="border-manus-border bg-manus-tertiary text-manus-text">
-                                返回首页
+                            <Button variant="outline" onClick={() => setActiveWorkspace(null)} className="border-manus-border bg-manus-tertiary text-manus-text">
+                                <ArrowLeft className="h-4 w-4" />
+                                返回
                             </Button>
                         </div>
                     </DialogHeader>}
-                    <div className={cn('flex min-h-0 flex-1 flex-col', activeWorkspace === 'access-policies' ? 'p-0' : 'p-4')}>
+                    <div className={cn(
+                        'flex min-h-0 flex-1 flex-col',
+                        activeWorkspace === 'access-policies' ? 'p-0' : 'p-3 md:p-4',
+                    )}>
                     {activeWorkspace === 'governance' && (
                         <div className="flex min-h-0 flex-1 flex-col gap-3">
                             <div className="grid shrink-0 gap-3 md:grid-cols-4">
@@ -1300,7 +1338,7 @@ export function SemanticModelManager({
                             <div className="grid shrink-0 gap-3 sm:grid-cols-3">
                                 <div className="rounded-md border border-manus-border bg-manus px-4 py-3">
                                     <div className="text-xs text-manus-muted">全部待复核</div>
-                                    <div className="mt-1 text-2xl font-semibold text-manus-text">{pendingReviewAssets.length}</div>
+                                    <div className="mt-1 text-2xl font-semibold text-manus-text">{pendingReviewCount}</div>
                                 </div>
                                 <div className="rounded-md border border-amber-500/25 bg-amber-500/10 px-4 py-3">
                                     <div className="text-xs text-amber-700">过期，可检查后启用</div>
@@ -1374,7 +1412,7 @@ export function SemanticModelManager({
                                         >
                                             <div className="flex items-center justify-between gap-2">
                                                 <span className="truncate text-sm font-medium text-manus-text">{table.business_name}</span>
-                                                <span className="flex items-center gap-1">{syncBadge(table.sync_state)}{statusBadge(table.status)}</span>
+                                                {statusBadge(table.status)}
                                             </div>
                                             <div className="mt-1 truncate text-xs text-manus-muted">{table.physical_name}</div>
                                         </button>
@@ -1390,9 +1428,8 @@ export function SemanticModelManager({
                                                 <div className="min-w-0">
                                                     <div className="flex flex-wrap items-center gap-2">
                                                         <span className="break-all font-medium text-manus-text">{activeTable.business_name}</span>
-                                                        {syncBadge(activeTable.sync_state)}
                                                         {statusBadge(activeTable.status)}
-                                                        {accessBadges(activeTable.is_sensitive, activeTable.business_semantics_status)}
+                                                        {sensitivityBadge(activeTable.is_sensitive)}
                                                     </div>
                                                     <div className="mt-1 break-all text-xs text-manus-muted">{activeTable.physical_name}</div>
                                                 </div>
@@ -1415,15 +1452,6 @@ export function SemanticModelManager({
                                                         className="border-emerald-500/30 text-emerald-600"
                                                     >
                                                         接受本表全部建议
-                                                    </Button>
-                                                    <Button
-                                                        size="sm"
-                                                        variant="outline"
-                                                        onClick={() => setActiveWorkspace('access-policies')}
-                                                        className="border-manus-border bg-manus-tertiary text-manus-text"
-                                                    >
-                                                        <Lock className="mr-1 h-4 w-4" />
-                                                        权限
                                                     </Button>
                                                     <Switch
                                                         checked={activeTable.status === 'confirmed' && activeTable.is_queryable}
@@ -1461,28 +1489,11 @@ export function SemanticModelManager({
                                                     </div>
                                                 )
                                             })()}
-                                            <div className="grid gap-3 border-t border-manus-border/70 pt-3 lg:grid-cols-[180px_minmax(0,1fr)_220px]">
-                                                <div>
-                                                    <div className="text-sm font-medium text-manus-text">行级权限</div>
-                                                    <div className="mt-1 text-xs text-manus-muted">由统一语义访问策略编译执行</div>
-                                                </div>
-                                                <div className="rounded border border-manus-border bg-manus-secondary px-3 py-2 text-sm text-manus-muted">
-                                                    当前模式：
-                                                    <span className="ml-1 text-manus-text">
-                                                        统一策略中心
-                                                    </span>
-                                                    <span className="ml-2 text-xs">支持本人、部门和静态条件模板。</span>
-                                                </div>
-                                                <Button size="sm" variant="outline" onClick={() => setActiveWorkspace('access-policies')} className="border-manus-border bg-manus-tertiary text-manus-text">
-                                                    打开权限策略
-                                                </Button>
-                                            </div>
                                         </div>
 
-                                        <div className="grid shrink-0 grid-cols-[minmax(170px,0.9fr)_minmax(260px,1.5fr)_150px_230px] border-b border-manus-border bg-manus-secondary px-4 py-2 text-sm text-manus-muted">
+                                        <div className="grid shrink-0 grid-cols-[minmax(190px,0.85fr)_minmax(320px,1.7fr)_230px] border-b border-manus-border bg-manus-secondary px-4 py-2 text-sm text-manus-muted">
                                             <div>字段</div>
                                             <div>业务语义</div>
-                                            <div>权限</div>
                                             <div className="text-right">操作</div>
                                         </div>
                                         <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
@@ -1492,11 +1503,11 @@ export function SemanticModelManager({
                                                 const columnDraft = draftForObject('column', column)
                                                 const columnEditing = isEditingObject('column', column.id)
                                                 return (
-                                                    <div key={column.id} className="grid grid-cols-[minmax(170px,0.9fr)_minmax(260px,1.5fr)_150px_230px] items-start gap-3 border-b border-manus-border/70 px-4 py-3 text-sm">
+                                                    <div key={column.id} className="grid grid-cols-[minmax(190px,0.85fr)_minmax(320px,1.7fr)_230px] items-start gap-3 border-b border-manus-border/70 px-4 py-3 text-sm">
                                                         <div className="min-w-0">
                                                             <div className="flex flex-wrap items-center gap-2">
                                                                 <span className="break-all font-medium text-manus-text">{column.physical_name}</span>
-                                                                {syncBadge(column.sync_state)}
+                                                                {sensitivityBadge(column.is_sensitive)}
                                                             </div>
                                                             <div className="mt-1 break-all text-xs text-manus-muted">{column.data_type}</div>
                                                             <div className="mt-1 flex items-center gap-2 text-[11px] text-manus-muted">
@@ -1519,7 +1530,6 @@ export function SemanticModelManager({
                                                                 </div>
                                                             )}
                                                         </div>
-                                                        <div>{accessBadges(column.is_sensitive, column.business_semantics_status)}</div>
                                                         <div className="flex flex-wrap items-center justify-end gap-2">
                                                             {columnEditing ? (
                                                                 <Button size="sm" variant="outline" onClick={() => saveObjectEdit('column', column, columnDraft)} disabled={isSaving || !columnDraft.businessName.trim()} className="border-manus-border bg-manus-tertiary text-manus-text">
@@ -1532,14 +1542,6 @@ export function SemanticModelManager({
                                                                     编辑
                                                                 </Button>
                                                             )}
-                                                            <Button
-                                                                size="sm"
-                                                                variant="outline"
-                                                                onClick={() => setActiveWorkspace('access-policies')}
-                                                                className="border-manus-border bg-manus-tertiary text-manus-text"
-                                                            >
-                                                                <Lock className="h-4 w-4" />
-                                                            </Button>
                                                             <Switch checked={columnEnabled} disabled={isSaving || !tableEnabled || column.sync_state === 'orphaned'} onCheckedChange={checked => updateModel('columns', column.id, { status: checked ? 'confirmed' : 'disabled', is_queryable: checked, ...(checked ? { sync_state: 'current' } : {}) })} />
                                                         </div>
                                                     </div>

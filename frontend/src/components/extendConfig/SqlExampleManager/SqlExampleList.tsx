@@ -36,6 +36,12 @@ export function SqlExampleList({
     onToggleActive,
     isFiltered,
 }: SqlExampleListProps) {
+    const statusLabels = {
+        draft: { label: '草稿', className: 'bg-slate-500/15 text-slate-400' },
+        valid: { label: '已校验', className: 'bg-emerald-500/15 text-emerald-400' },
+        invalid: { label: '校验失败', className: 'bg-red-500/15 text-red-400' },
+        stale: { label: '需重新校验', className: 'bg-amber-500/15 text-amber-400' },
+    } as const
     // 展开状态管理
     const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set())
 
@@ -88,6 +94,7 @@ export function SqlExampleList({
                 {examples.map((example) => {
                     const isExpanded = expandedIds.has(example.id)
                     const isSelected = selectedIds.has(example.id)
+                    const status = statusLabels[example.validation_status] || statusLabels.draft
                     
                     return (
                         <div
@@ -135,6 +142,9 @@ export function SqlExampleList({
                                     )}>
                                         {example.question}
                                     </span>
+                                    <span className={cn('px-2 py-0.5 rounded-full text-[11px] whitespace-nowrap', status.className)}>
+                                        {status.label}
+                                    </span>
                                 </button>
 
                                 {/* 操作按钮 */}
@@ -142,6 +152,7 @@ export function SqlExampleList({
                                     <Switch
                                         checked={example.is_active}
                                         onCheckedChange={() => onToggleActive(example)}
+                                        disabled={example.validation_status !== 'valid'}
                                         className="scale-90"
                                     />
                                     <Button
@@ -186,6 +197,18 @@ export function SqlExampleList({
                                         <p className="mt-2 text-xs text-manus-muted pl-1">
                                             💡 {example.description}
                                         </p>
+                                    )}
+                                    <div className="mt-2 flex flex-wrap gap-3 text-xs text-manus-muted pl-1">
+                                        <span>匹配次数：{example.match_count || 0}</span>
+                                        {example.last_matched_at && <span>最近匹配：{new Date(example.last_matched_at).toLocaleString()}</span>}
+                                        {(example.parameters || []).length > 0 && (
+                                            <span>动态参数：{example.parameters.map(item => item.label).join('、')}</span>
+                                        )}
+                                    </div>
+                                    {(example.validation_errors || []).length > 0 && (
+                                        <div className="mt-2 rounded border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs text-red-400">
+                                            {example.validation_errors.map(item => item.message).join('；')}
+                                        </div>
                                     )}
                                 </div>
                             )}

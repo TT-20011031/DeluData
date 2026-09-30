@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import type { SemanticAccessTableRule } from '@/types/extendConfig'
 import {
+    bootstrapEffectiveRules,
     hasSemanticAccessPermissionChanges,
+    persistedSemanticAccessTableRule,
+    semanticAccessDecisionOriginLabel,
     semanticAccessPermissionFingerprint,
 } from './semanticAccessPolicyDraftUtils'
 
@@ -14,6 +17,61 @@ const visibleRule: SemanticAccessTableRule = {
 }
 
 describe('semantic access permission fingerprint', () => {
+    it('keeps the saved decision visible until a staged follow change is saved', () => {
+        const inherited = {
+            ...visibleRule,
+            decision: 'hidden' as const,
+            is_direct_override: false,
+            source: 'org_unit' as const,
+            sources: [{
+                binding_id: 8,
+                target_type: 'org_unit' as const,
+                target_id: '22',
+                label: '生产部',
+            }],
+            override_seed: { ...visibleRule, decision: 'hidden' as const },
+        }
+
+        expect(persistedSemanticAccessTableRule(1, [visibleRule], [inherited])).toEqual({
+            rule: visibleRule,
+            direct: true,
+            effectiveRule: inherited,
+        })
+        expect(persistedSemanticAccessTableRule(1, [], [inherited])).toEqual({
+            rule: inherited,
+            direct: false,
+            effectiveRule: inherited,
+        })
+    })
+
+    it('uses inherited effective rules while the first-run draft remains open', () => {
+        const inherited = [{
+            ...visibleRule,
+            is_direct_override: false,
+            source: 'org_unit' as const,
+            sources: [{
+                binding_id: 8,
+                target_type: 'org_unit' as const,
+                target_id: '22',
+                label: '生产部',
+            }],
+            override_seed: visibleRule,
+        }]
+
+        expect(bootstrapEffectiveRules(inherited, [])).toEqual(inherited)
+    })
+
+    it('labels direct and inherited decisions without changing effective visibility', () => {
+        expect(semanticAccessDecisionOriginLabel('position', true, [])).toBe('本级决策')
+        expect(semanticAccessDecisionOriginLabel('position', false, [{
+            binding_id: 8,
+            target_type: 'org_unit',
+            target_id: '22',
+            label: '生产部',
+        }])).toBe('跟随生产部决策')
+        expect(semanticAccessDecisionOriginLabel('user', false, [])).toBe('跟随上级决策（默认拒绝）')
+    })
+
     it('treats table and hidden asset ordering as equivalent', () => {
         const left = [visibleRule, {
             table_id: 2,

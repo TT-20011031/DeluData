@@ -42,9 +42,24 @@ class BootstrapTargetDraftUpdateRequest(BootstrapRevisionRequest):
     reason: Optional[str] = Field(default=None, max_length=2000)
 
 
+class BootstrapTargetPublishRequest(BootstrapTargetDraftUpdateRequest):
+    table_ids: list[int] = Field(min_length=1, max_length=1000)
+    confirm_warnings: bool = True
+
+
 class BootstrapMappingUpdateRequest(BootstrapRevisionRequest):
     accepted: bool
     proposed_mapping: dict[str, Any]
+
+
+class BootstrapMappingReviewDecision(BaseModel):
+    suggestion_id: int = Field(gt=0)
+    action: Literal["accept", "reject"]
+    proposed_mapping: Optional[dict[str, Any]] = None
+
+
+class BootstrapMappingReviewsRequest(BootstrapRevisionRequest):
+    decisions: list[BootstrapMappingReviewDecision] = Field(min_length=1, max_length=1000)
 
 
 class BootstrapReviewDecision(BaseModel):
@@ -259,6 +274,35 @@ async def put_target_draft(
         raise _http_error(exc) from exc
 
 
+@router.post(
+    "/runs/{run_id}/targets/{target_type}/{target_id}/publish-tables",
+    summary="确认并立即生效指定授权对象的表权限",
+)
+async def publish_target_tables(
+    run_id: int,
+    target_type: Literal["baseline", "org_unit"],
+    target_id: str,
+    request: BootstrapTargetPublishRequest,
+    admin: User = Depends(CheckPerm("semantic_access:manage")),
+):
+    try:
+        return await get_semantic_access_bootstrap_service().publish_target_tables(
+            admin.workspace_id,
+            run_id,
+            target_type,
+            target_id,
+            str(admin.id),
+            request.expected_revision,
+            table_ids=request.table_ids,
+            definition=request.definition,
+            include_descendants=request.include_descendants,
+            reason=request.reason,
+            confirm_warnings=request.confirm_warnings,
+        )
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
 @router.patch("/runs/{run_id}/targets/{suggestion_id}", summary="更新 AI 目标策略草案")
 async def update_target(
     run_id: int,
@@ -296,6 +340,24 @@ async def update_mapping(
             request.expected_revision,
             accepted=request.accepted,
             proposed_mapping=request.proposed_mapping,
+        )
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@router.patch("/runs/{run_id}/ownership-mapping-reviews", summary="批量审核 AI 行归属映射")
+async def review_ownership_mappings(
+    run_id: int,
+    request: BootstrapMappingReviewsRequest,
+    admin: User = Depends(CheckPerm("semantic_access:manage")),
+):
+    try:
+        return await get_semantic_access_bootstrap_service().review_ownership_mappings(
+            admin.workspace_id,
+            run_id,
+            str(admin.id),
+            request.expected_revision,
+            [row.model_dump() for row in request.decisions],
         )
     except Exception as exc:
         raise _http_error(exc) from exc

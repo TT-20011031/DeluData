@@ -21,6 +21,7 @@ from app.tools.base import BaseToolInput
 class SqlToolInput(BaseToolInput):
     """SQL 工具输入参数"""
     # BaseToolInput covers query, user_id, session_id, parent_step_id, memory_dfs, messages
+    original_query: Optional[str] = Field(default=None, description="未经 Planner 改写的原始用户问题")
     summary: str = Field(default="", description="会话长期摘要")
     current_focus_result: Optional[dict] = Field(default=None, description="当前正在讨论的数据结果快照")
     execution_results: Optional[list] = Field(default=None, description="近期 Worker 执行结果")
@@ -40,6 +41,7 @@ async def run_sql_task(
     execution_results: Optional[list] = None,
     round_index: int = 0,  # [P1] 用于 df_key 语义化命名
     semantic_clarification: Optional[dict] = None,
+    original_query: Optional[str] = None,
     **kwargs
 ) -> "WorkerResult":
     """
@@ -63,6 +65,7 @@ async def run_sql_task(
     worker = get_sql_worker()
     result = await worker.execute_task(
         task_description=query,
+        original_query=original_query,
         user_id=user_id,
         session_id=session_id,
         parent_step_id=parent_step_id,
@@ -79,25 +82,25 @@ async def run_sql_task(
     # 检查结果是否成功（不抛异常，统一由 Router 消费质量信号）
     if not result.get("success"):
         error_msg = result.get("error", "SQL 执行失败")
-        lowered = error_msg.lower()
-        if result.get("semantic_clarification") or result.get("error_type") in {"permission_rewrite_required", "semantic_clarification_required"}:
+        error_type = str(result.get("error_type") or "sql_execution_failed")
+        if result.get("semantic_clarification") or error_type in {"permission_rewrite_required", "semantic_clarification_required", "metric_ambiguous"}:
             reason_code = "semantic_clarification_required"
             retryable = False
-        elif "权限" in error_msg or "permission" in lowered:
+        elif error_type in {"permission_denied", "sql_permission_denied", "sensitive_object"}:
             reason_code = "sql_permission_denied"
             retryable = False
-        elif "不存在的数据表" in error_msg or "doesn't exist" in lowered or "does not exist" in lowered:
-            reason_code = "sql_table_not_found"
-            retryable = True
-        elif "syntax" in lowered or "语法" in error_msg:
-            reason_code = "sql_syntax_error"
-            retryable = True
-        elif "timeout" in lowered or "超时" in error_msg:
-            reason_code = "timeout"
-            retryable = True
+        elif error_type in {"semantic_model_incomplete", "join_path_ambiguous"}:
+            reason_code = "semantic_model_incomplete"
+            retryable = False
         else:
-            reason_code = "sql_execution_failed"
-            retryable = True
+            reason_code = error_type
+            retryable = bool(result.get("retryable", error_type in {
+                "sql_execution_failed",
+                "sql_syntax_error",
+                "sql_table_not_found",
+                "timeout",
+                "semantic_unavailable",
+            }))
 
         return WorkerResult(
             output=f"SQL 执行失败：{error_msg}",
@@ -115,6 +118,12 @@ async def run_sql_task(
                 "chunks_used": 0,
                 "stop_reason": reason_code,
                 "latency_ms": int((time.perf_counter() - started) * 1000),
+                "success": False,
+                "error": error_msg,
+                "error_type": error_type,
+                "from_semantic": bool(result.get("from_semantic")),
+                "semantic_fallback_blocked": bool(result.get("semantic_fallback_blocked")),
+                "error_details": result.get("error_details") or {},
                 **({"clarification": result.get("semantic_clarification")} if result.get("semantic_clarification") else {}),
             },
         )

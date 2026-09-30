@@ -578,7 +578,7 @@ async def synthesizer_node(state: SupervisorState) -> SupervisorState:
     # [Session Round] 获取当前轮次供文字流关联
     round_index = state.get("round_index", 0)
 
-    if state.get("is_direct_execution") and results:
+    if results:
         latest = results[-1] if isinstance(results[-1], dict) else {}
         meta = latest.get("meta") or {}
         if latest.get("worker") == "sql_worker" and meta.get("semantic_fallback_blocked"):
@@ -587,7 +587,7 @@ async def synthesizer_node(state: SupervisorState) -> SupervisorState:
                 final_answer = f"{final_answer}\n\n请改问你有权限访问的数据范围，或联系管理员调整语义模型可见范围。"
             elif meta.get("error_type") == "semantic_unavailable":
                 final_answer = f"{final_answer}\n\n请联系管理员启用语义模型后再使用 SQL 查询。"
-            else:
+            elif meta.get("error_type") != "permission_denied":
                 final_answer = f"{final_answer}\n\n本次请求已按权限策略终止，没有生成或执行自由 SQL。"
 
             assistant_message_id = str(plan_id or uuid.uuid4())

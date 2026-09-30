@@ -265,7 +265,7 @@ def _decide_action(
     if reason_code in RETRY_REASON_CODES or retryable:
         return "retry_self"
     if verdict in {"fail", "partial"}:
-        return "retry_self"
+        return "finish"
     return "finish"
 
 
@@ -289,6 +289,15 @@ def _should_keep_repair_in_knowledge_chain(
     if reason_code == "rag_low_relevance" and _looks_like_knowledge_query(user_query):
         return True
     return False
+
+
+def _should_keep_confirmed_sql_route(
+    *,
+    current_worker: str,
+    confirmed_sql_query: bool,
+) -> bool:
+    """A user-confirmed SQL task must not silently change its data source to RAG."""
+    return current_worker == "sql_worker" and bool(confirmed_sql_query)
 
 
 def _normalize_retry_budget(value: int) -> int:
@@ -391,9 +400,21 @@ async def router_agent_node(state: SupervisorState) -> SupervisorState:
             "plan_status": "suspended",
         }
 
+    if reason_code == "semantic_model_incomplete":
+        latest_signal["route_action"] = "finish"
+        return {
+            "route_action": "finish",
+            "latest_quality_signal": latest_signal,
+            "plan_status": "error",
+        }
+
     # Router 开关关闭时，启用最小兜底质检，不裸奔直出。
     if not settings.supervisor.router_agent_enabled:
-        if verdict in {"fail", "partial"} and retry_count < max_retries:
+        if (
+            verdict in {"fail", "partial"}
+            and (retryable or reason_code in RETRY_REASON_CODES)
+            and retry_count < max_retries
+        ):
             action = "retry_self"
         else:
             action = "finish"
@@ -416,6 +437,14 @@ async def router_agent_node(state: SupervisorState) -> SupervisorState:
         action = "retry_self" if retryable else "finish"
         effective_reason_code = reason_code
 
+    confirmed_sql_guard = _should_keep_confirmed_sql_route(
+        current_worker=current_worker,
+        confirmed_sql_query=bool(state.get("confirmed_sql_query", False)),
+    )
+    if action == "switch_worker" and confirmed_sql_guard:
+        action = "finish"
+        effective_reason_code = reason_code
+
     # 将用户/租户配置 max_retries 作为 Router 修复预算：
     # 预算耗尽后直接 finish，进入输出节点，不再继续修复。
     if action in REPAIR_ACTIONS and retry_count >= max_retries:
@@ -432,6 +461,7 @@ async def router_agent_node(state: SupervisorState) -> SupervisorState:
             reason_code=reason_code,
             user_query=user_query,
         ),
+        "confirmed_sql_guard": confirmed_sql_guard,
         "wrong_tool_repair": bool(
             current_worker == "doc_worker"
             and reason_code in KNOWLEDGE_EMPTY_REASON_CODES

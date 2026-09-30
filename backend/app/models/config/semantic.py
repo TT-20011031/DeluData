@@ -352,6 +352,7 @@ class SemanticOwnershipMappingModel(Base):
     table_id = Column(Integer, nullable=False, index=True)
     org_column_id = Column(Integer, nullable=True)
     org_value_kind = Column(String(16), nullable=False, default="id")
+    org_value_mapping_json = Column(JSON, nullable=False, default=dict)
     user_column_id = Column(Integer, nullable=True)
     user_value_kind = Column(String(16), nullable=False, default="id")
     updated_by = Column(String(64), nullable=True)

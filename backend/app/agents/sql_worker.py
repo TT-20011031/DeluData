@@ -34,6 +34,10 @@ from app.services.sql_result_diagnostics import (
     analyze_sql_result,
     append_diagnostics_text,
 )
+from app.services.sql_example_service import (
+    execute_semantic_query_with_private_examples,
+    execute_verified_sql_example_if_matched,
+)
 from app.skills.xiyan_skill import get_xiyan_skill
 
 logger = logging.getLogger(__name__)
@@ -180,6 +184,10 @@ def _member_semantic_error_type(error_type: Optional[str]) -> str:
         return "permission_rewrite_required"
     if error_type in {"permission_denied", "sensitive_object"}:
         return "permission_denied"
+    if error_type in {"metric_ambiguous", "field_ambiguous", "table_ambiguous", "time_field_ambiguous", "clarification_required", "semantic_clarification_required"}:
+        return "semantic_clarification_required"
+    if error_type in {"join_path_ambiguous", "semantic_model_incomplete"}:
+        return "semantic_model_incomplete"
     return "semantic_unavailable"
 
 
@@ -531,6 +539,7 @@ class SqlWorker:
         run_mode: Literal["auto", "semantic_only", "legacy_only"] = "auto",
         expected_limit: Optional[int] = None,
         semantic_clarification: Optional[dict] = None,
+        original_query: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         执行取数任务
@@ -553,6 +562,8 @@ class SqlWorker:
             current_focus_result=current_focus_result or {},
             execution_results=execution_results or [],
         )
+        semantic_question = str(original_query or task_description).strip()
+        semantic_context_hint = effective_task_description if effective_task_description != semantic_question else None
         logger.info(f"SqlWorker: 开始执行, user_id={user_id}, task={task_description[:50]}...")
 
         workspace_id = await _resolve_workspace_id_for_user(user_id)
@@ -607,13 +618,113 @@ class SqlWorker:
                 "semantic_fallback_blocked": True,
             }
 
+        # Complex SQL examples cannot be represented losslessly by IntentQuery.
+        # Give an account-owned, currently authorized verified template priority
+        # even while the general semantic runtime is disabled or in shadow mode;
+        # otherwise the legacy generator would silently replace it with a
+        # different query.
+        if (
+            run_mode != "legacy_only"
+            and workspace_id
+            and runtime_mode in {"disabled", "shadow"}
+        ):
+            try:
+                verified_result = await execute_verified_sql_example_if_matched(
+                    semantic_service,
+                    question=semantic_question,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    session_id=session_id,
+                    expected_limit=expected_limit,
+                )
+            except SemanticQueryError as exc:
+                logger.warning(
+                    "SqlWorker: 复杂 SQL 示例拒绝执行 error_type=%s message=%s",
+                    exc.error_type,
+                    exc.message,
+                )
+                return {
+                    "success": False,
+                    "error": exc.message,
+                    "error_type": exc.error_type,
+                    "retryable": bool(exc.retryable),
+                    "error_details": exc.details if isinstance(exc.details, dict) else {},
+                    "suggestion": (
+                        (exc.details or {}).get("suggestion")
+                        if isinstance(exc.details, dict)
+                        else "请重新校验 SQL 示例及其数据权限。"
+                    ),
+                    "from_semantic": True,
+                    "from_example": True,
+                    "semantic_fallback_blocked": True,
+                }
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("SqlWorker: 复杂 SQL 示例匹配/执行异常: %s", exc)
+                verified_result = None
+
+            if verified_result is not None:
+                example_match = verified_result.sql_example_match or next(
+                    (
+                        item
+                        for item in (verified_result.diagnostics or [])
+                        if item.get("type") == "sql_example_match"
+                    ),
+                    None,
+                )
+                if session_id:
+                    await emit_step_update(
+                        session_id=session_id,
+                        step_id="sql-example-match",
+                        status="done",
+                        label=f"SQL示例匹配: 已原样执行“{(example_match or {}).get('question', '')[:32]}”",
+                        parent_step_id=parent_step_id or None,
+                    )
+                tables_name = "_".join(verified_result.referenced_tables[:2]) or "query"
+                tables_name = tables_name.replace(".", "_").replace("-", "_")[:30]
+                df_key = f"sql_{tables_name}_r{round_index}"
+                df = pd.DataFrame(verified_result.data)
+                semantic_access = (
+                    (verified_result.plan or {}).get("user_access", {}).get("semantic_access", {})
+                )
+                stamp_semantic_dataframe(
+                    df,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    authorization_revision=int(semantic_access.get("authorization_revision") or 0),
+                    authorization_valid_until=semantic_access.get("authorization_valid_until"),
+                )
+                return {
+                    "success": True,
+                    "sql": verified_result.sql,
+                    "rewrite": "verified_sql_example",
+                    "selected_tables": verified_result.referenced_tables,
+                    "referenced_tables": verified_result.referenced_tables,
+                    "xiyan_selected_tables": [],
+                    "data": verified_result.data,
+                    "columns": verified_result.columns,
+                    "row_count": verified_result.row_count,
+                    "result_text": verified_result.result_text,
+                    "df_key": df_key,
+                    "artifacts": {df_key: df},
+                    "ambiguity_warning": None,
+                    "from_example": True,
+                    "from_semantic": True,
+                    "semantic_intent": verified_result.intent,
+                    "semantic_plan": verified_result.plan,
+                    "semantic_run_id": verified_result.run_id,
+                    "diagnostics": verified_result.diagnostics,
+                    "removed_pseudo_source_columns": [],
+                }
+
         if run_mode == "auto" and runtime_mode == "shadow" and workspace_id and not semantic_guard_required:
             correlation_id = uuid.uuid4().hex
 
             async def _run_semantic_shadow():
                 try:
-                    result = await semantic_service.execute_semantic_query(
-                        question=effective_task_description,
+                    result = await execute_semantic_query_with_private_examples(
+                        semantic_service,
+                        question=semantic_question,
+                        context_hint=semantic_context_hint,
                         user_id=user_id,
                         workspace_id=workspace_id or "",
                         session_id=session_id,
@@ -640,6 +751,7 @@ class SqlWorker:
                 self.execute_task(
                     task_description=task_description,
                     user_id=user_id,
+                    original_query=original_query,
                     session_id=session_id,
                     parent_step_id=parent_step_id,
                     round_index=round_index,
@@ -702,8 +814,10 @@ class SqlWorker:
                     label="语义问数: 正在解析查询计划...",
                     parent_step_id=parent_step_id or None,
                 ) if session_id else None
-                semantic_result = await semantic_service.execute_semantic_query(
-                    question=effective_task_description,
+                semantic_result = await execute_semantic_query_with_private_examples(
+                    semantic_service,
+                    question=semantic_question,
+                    context_hint=semantic_context_hint,
                     user_id=user_id,
                     workspace_id=workspace_id or "",
                     session_id=session_id,
@@ -711,6 +825,22 @@ class SqlWorker:
                     expected_limit=expected_limit,
                     semantic_clarification=semantic_clarification,
                 )
+                example_match = next(
+                    (
+                        item
+                        for item in (semantic_result.diagnostics or [])
+                        if item.get("type") == "sql_example_match"
+                    ),
+                    None,
+                )
+                if example_match and session_id:
+                    await emit_step_update(
+                        session_id=session_id,
+                        step_id="sql-example-match",
+                        status="done",
+                        label=f"SQL示例匹配: 已采用“{example_match.get('question', '')[:32]}”作为口径参考",
+                        parent_step_id=parent_step_id or None,
+                    )
                 tables_name = "_".join(semantic_result.referenced_tables[:2]) if semantic_result.referenced_tables else "query"
                 tables_name = tables_name.replace(".", "_").replace("-", "_")[:30]
                 df_key = f"sql_{tables_name}_r{round_index}"
@@ -746,7 +876,7 @@ class SqlWorker:
                     "df_key": df_key,
                     "artifacts": {df_key: df},
                     "ambiguity_warning": None,
-                    "from_example": False,
+                    "from_example": bool(example_match),
                     "from_semantic": True,
                     "semantic_intent": semantic_result.intent,
                     "semantic_plan": semantic_result.plan,
@@ -778,11 +908,19 @@ class SqlWorker:
             fallback_enabled = bool(datasource and datasource.semantic_sql_fallback_enabled)
             if semantic_guard_required or run_mode == "semantic_only" or not exc.safe_to_fallback or not fallback_enabled:
                 public_error_type = _member_semantic_error_type(exc.error_type) if semantic_guard_required else exc.error_type
+                if public_error_type == "semantic_model_incomplete":
+                    suggestion = "请联系管理员确认语义模型中的表关系与 Join 路径。"
+                elif public_error_type == "semantic_clarification_required":
+                    suggestion = "请选择一个明确的语义对象后继续。"
+                else:
+                    suggestion = "请联系管理员检查语义模型、权限或只读数据库账号配置。"
                 failure_result = {
                     "success": False,
                     "error": exc.message,
                     "error_type": public_error_type,
-                    "suggestion": "请联系管理员检查语义模型、权限或只读数据库账号配置。",
+                    "retryable": bool(exc.retryable),
+                    "error_details": {},
+                    "suggestion": suggestion,
                     "from_semantic": True,
                     "semantic_fallback_blocked": True,
                 }
@@ -809,6 +947,7 @@ class SqlWorker:
                 "success": False,
                 "error": message,
                 "error_type": "semantic_unavailable",
+                "retryable": False,
                 "suggestion": "请联系管理员检查语义模型、权限和只读数据库账号配置。",
                 "from_semantic": True,
                 "semantic_fallback_blocked": True,
@@ -819,6 +958,7 @@ class SqlWorker:
                 "success": False,
                 "error": "语义评估链路不可用：未找到可用语义数据源或语义模型目录。",
                 "error_type": semantic_error_type or "semantic_unavailable",
+                "retryable": False,
                 "from_semantic": True,
                 "semantic_fallback_blocked": True,
             }
@@ -867,52 +1007,11 @@ class SqlWorker:
                 except Exception as e:
                     logger.warning(f"SSE 推送失败: {e}")
         
-        # 4. 优先尝试 SQL 示例向量匹配
+        # 4. 旧生成链路不读取 SQL 示例。示例只在前面的语义权限链路中
+        # 转换为结构化意图，并重新经过权限解析与安全 SQL 编译。
         sql = None
         use_example = False
-        
-        try:
-            from app.models.config.sql_example_embeddings import search_sql_examples_by_similarity
-            from app.core.db.database import get_async_db_context
-            from app.models.auth.rbac import UserModel
-            from sqlalchemy import select
-            
-            # 获取用户工作空间 ID（从用户表读取）
-            workspace_id = None
-            try:
-                async with get_async_db_context() as db:
-                    result = await db.execute(
-                        select(UserModel.workspace_id).where(UserModel.id == user_id)
-                    )
-                    workspace_id = result.scalar_one_or_none()
-            except Exception as e:
-                logger.warning(f"SqlWorker: 获取 workspace_id 失败: {e}")
-            
-            if not workspace_id:
-                workspace_id = user_id  # 兜底兼容旧逻辑
-            
-            await on_step("SQL示例匹配", "running", "正在匹配已配置的 SQL 示例...")
-            
-            matched_examples = await search_sql_examples_by_similarity(
-                question=effective_task_description,
-                workspace_id=workspace_id,
-                n_results=1
-            )
-            
-            if matched_examples:
-                example, similarity = matched_examples[0]
-                sql = example.sql
-                use_example = True
-                logger.info(f"SqlWorker: 匹配到 SQL 示例 (相似度: {similarity:.2f}), 跳过 XiYan")
-                await on_step("SQL示例匹配", "done", f"找到相似问题，直接使用示例 SQL (相似度: {similarity*100:.1f}%)")
-            else:
-                logger.info("SqlWorker: 未匹配到 SQL 示例，将调用 XiYan")
-                await on_step("SQL示例匹配", "done", "未找到匹配的示例，将调用 XiYan 生成")
-                
-        except Exception as e:
-            logger.warning(f"SqlWorker: SQL 示例匹配失败: {e}, 将 fallback 到 XiYan")
-            await on_step("SQL示例匹配", "done", f"匹配失败，将调用 XiYan")
-        
+
         # 5. Fallback: 调用 XiYan 生成 SQL
         xiyan_result = None
         async def _generate_with_xiyan(prompt_text: str):
